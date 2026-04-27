@@ -267,7 +267,7 @@ def combine_selected_sheets(sheet_map: dict[str, pd.DataFrame], selected_sheets:
     frames: list[pd.DataFrame] = []
     for sheet_name in selected_sheets:
         df = sheet_map[sheet_name].copy()
-        df["__SHEET__"] = sheet_name
+        df["__SOURCE__"] = sheet_name
         frames.append(df)
     if not frames:
         return pd.DataFrame()
@@ -305,14 +305,14 @@ def aggregate_summary_exact_date(df: pd.DataFrame, target_date: date) -> Aggrega
     grouped = work.groupby("__PORT__")["__AMOUNT__"].sum()
     result = base_result().add(grouped, fill_value=0.0)
 
-    detail = work[[date_col, port_col, amount_col, "__PORT__", "__AMOUNT__", "__SHEET__"]].rename(
+    detail = work[[date_col, port_col, amount_col, "__PORT__", "__AMOUNT__", "__SOURCE__"]].rename(
         columns={
             date_col: "TANGGAL_SUMMARY",
             port_col: "ASAL_SUMBER",
             amount_col: "NOMINAL_SUMBER",
             "__PORT__": "PELABUHAN",
             "__AMOUNT__": "NOMINAL",
-            "__SHEET__": "SHEET",
+            "__SOURCE__": "SUMBER_FILE_SHEET",
         }
     )
     if detail.empty:
@@ -348,14 +348,14 @@ def aggregate_summary_range(df: pd.DataFrame, start_date: date, end_date: date) 
     grouped = work.groupby("__PORT__")["__AMOUNT__"].sum()
     result = base_result().add(grouped, fill_value=0.0)
 
-    detail = work[[date_col, port_col, amount_col, "__PORT__", "__AMOUNT__", "__SHEET__"]].rename(
+    detail = work[[date_col, port_col, amount_col, "__PORT__", "__AMOUNT__", "__SOURCE__"]].rename(
         columns={
             date_col: "TANGGAL_SUMMARY",
             port_col: "ASAL_SUMBER",
             amount_col: "NOMINAL_SUMBER",
             "__PORT__": "PELABUHAN",
             "__AMOUNT__": "NOMINAL",
-            "__SHEET__": "SHEET",
+            "__SOURCE__": "SUMBER_FILE_SHEET",
         }
     )
     if detail.empty:
@@ -394,13 +394,13 @@ def aggregate_invoice_range(df: pd.DataFrame, start_date: date, end_date: date) 
     grouped = work.groupby("__PORT__")["__AMOUNT__"].sum()
     result = base_result().add(grouped, fill_value=0.0)
 
-    selected_columns = [port_col, amount_col, "__PORT__", "__AMOUNT__", "__SHEET__"]
+    selected_columns = [port_col, amount_col, "__PORT__", "__AMOUNT__", "__SOURCE__"]
     rename_map = {
         port_col: "ASAL_SUMBER",
         amount_col: "NOMINAL_SUMBER",
         "__PORT__": "PELABUHAN",
         "__AMOUNT__": "NOMINAL",
-        "__SHEET__": "SHEET",
+        "__SOURCE__": "SUMBER_FILE_SHEET",
     }
     if date_col is not None:
         selected_columns.insert(0, date_col)
@@ -468,13 +468,13 @@ def extract_ticket_sold_structured(df: pd.DataFrame) -> AggregateResult:
 
     result = base_result().add(grouped, fill_value=0.0)
 
-    detail = detail_source[[port_col, amount_col, "__PORT__", "__AMOUNT__", "__SHEET__"]].rename(
+    detail = detail_source[[port_col, amount_col, "__PORT__", "__AMOUNT__", "__SOURCE__"]].rename(
         columns={
             port_col: "SUMBER_PORT",
             amount_col: "NOMINAL_SUMBER",
             "__PORT__": "PELABUHAN",
             "__AMOUNT__": "NOMINAL",
-            "__SHEET__": "SHEET",
+            "__SOURCE__": "SUMBER_FILE_SHEET",
         }
     )
     return AggregateResult(result, detail, warnings)
@@ -521,7 +521,7 @@ def extract_ticket_sold_report_style(df: pd.DataFrame) -> AggregateResult:
                 "NOMINAL": float(amount),
                 "PRIORITY": priority,
                 "ROW_TEXT": row_text,
-                "SHEET": row.get("__SHEET__", ""),
+                "SUMBER_FILE_SHEET": row.get("__SOURCE__", ""),
             }
         )
 
@@ -545,7 +545,7 @@ def extract_ticket_sold_report_style(df: pd.DataFrame) -> AggregateResult:
     grouped = chosen_df.groupby("PELABUHAN")["NOMINAL"].sum()
     result = base_result().add(grouped, fill_value=0.0)
 
-    detail = chosen_df[["PELABUHAN", "NOMINAL", "PRIORITY", "ROW_INDEX", "ROW_TEXT", "SHEET"]].rename(
+    detail = chosen_df[["PELABUHAN", "NOMINAL", "PRIORITY", "ROW_INDEX", "ROW_TEXT", "SUMBER_FILE_SHEET"]].rename(
         columns={"ROW_TEXT": "BARIS_SUMBER"}
     )
     return AggregateResult(result, detail, warnings)
@@ -620,24 +620,46 @@ def to_excel_bytes(reconciliation_df: pd.DataFrame, detail_tables: dict[str, pd.
     return output.getvalue()
 
 
+def load_multiple_files(uploaded_files: list[Any]) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    combined_sheet_map: dict[str, pd.DataFrame] = {}
+    errors: list[str] = []
+
+    for uploaded_file in uploaded_files:
+        try:
+            file_sheet_map = read_uploaded_file(uploaded_file)
+            for sheet_name, df in file_sheet_map.items():
+                combined_key = f"{uploaded_file.name} :: {sheet_name}"
+                df_copy = df.copy()
+                df_copy["__FILE__"] = uploaded_file.name
+                df_copy["__SHEET__"] = sheet_name
+                combined_sheet_map[combined_key] = df_copy
+        except Exception as exc:
+            errors.append(f"{uploaded_file.name}: {exc}")
+
+    return combined_sheet_map, errors
+
+
 def file_section(label: str, key_prefix: str) -> tuple[dict[str, pd.DataFrame] | None, list[str]]:
-    uploaded = st.file_uploader(
+    uploaded_files = st.file_uploader(
         label,
         type=["xlsx", "xls", "xlsm", "csv"],
         key=f"{key_prefix}_uploader",
+        accept_multiple_files=True,
     )
-    if uploaded is None:
+
+    if not uploaded_files:
         return None, []
 
-    try:
-        sheet_map = read_uploaded_file(uploaded)
-    except Exception as exc:
-        st.error(f"Gagal membaca file {label}: {exc}")
+    sheet_map, errors = load_multiple_files(uploaded_files)
+    for error in errors:
+        st.error(f"Gagal membaca file {label}: {error}")
+
+    if not sheet_map:
         return None, []
 
     sheet_names = list(sheet_map.keys())
     selected = st.multiselect(
-        f"Pilih sheet untuk {label}",
+        f"Pilih file/sheet untuk {label}",
         options=sheet_names,
         default=sheet_names,
         key=f"{key_prefix}_sheets",
@@ -650,8 +672,13 @@ def render_preview(name: str, sheet_map: dict[str, pd.DataFrame] | None, selecte
         return pd.DataFrame()
 
     combined = combine_selected_sheets(sheet_map, selected_sheets)
+    file_count = combined["__FILE__"].nunique() if "__FILE__" in combined.columns else 0
+
     with st.expander(f"Preview {name}", expanded=False):
-        st.caption(f"{len(selected_sheets)} sheet dipilih | {combined.shape[0]} baris | {combined.shape[1]} kolom")
+        st.caption(
+            f"{file_count} file | {len(selected_sheets)} file/sheet dipilih | "
+            f"{combined.shape[0]} baris | {combined.shape[1]} kolom"
+        )
         st.dataframe(combined.head(30), use_container_width=True, height=280)
         st.write("Kolom terdeteksi:", list(combined.columns))
     return combined
@@ -659,7 +686,10 @@ def render_preview(name: str, sheet_map: dict[str, pd.DataFrame] | None, selecte
 
 st.set_page_config(page_title="Rekonsiliasi Sales Channel", layout="wide")
 st.title("Rekonsiliasi Sales Channel")
-st.caption("Upload Tiket Terjual, Tiket Summary, dan Invoice untuk menghasilkan tabel rekonsiliasi per pelabuhan.")
+st.caption(
+    "Setiap uploader bisa upload banyak file Excel/CSV. "
+    "Pilih file/sheet yang ingin digabung untuk perhitungan rekonsiliasi."
+)
 
 with st.sidebar:
     st.subheader("Parameter")
@@ -696,7 +726,7 @@ ready = all(
 )
 
 if not ready:
-    st.info("Lengkapi 3 uploader dan pilih minimal 1 sheet pada masing-masing file.")
+    st.info("Lengkapi 3 uploader dan pilih minimal 1 file/sheet pada masing-masing uploader.")
 else:
     reconciliation_df, detail_tables, warnings_list = build_reconciliation(
         ticket_sold_df=ticket_sold_df,
