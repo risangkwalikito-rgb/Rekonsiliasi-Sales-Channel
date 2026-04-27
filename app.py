@@ -34,6 +34,7 @@ PORT_ALIASES = {
 SUMMARY_BP_DATE_COL = "CETAK BOARDING PASS"
 SUMMARY_PAYMENT_DATE_COL = "TANGGAL PEMBAYARAN"
 SUMMARY_AMOUNT_COL = "TARIF"
+
 INVOICE_DATE_COL = "TANGGAL INVOICE"
 INVOICE_AMOUNT_COL = "HARGA"
 
@@ -65,6 +66,14 @@ TICKET_SOLD_AMOUNT_CANDIDATES = [
 
 WINDOW_START = "00:00:00"
 WINDOW_END = "07:59:59"
+
+NUMERIC_COLUMNS = [
+    "Nominal Tiket Terjual",
+    "Nominal Penambahan",
+    "Nominal Pengurangan",
+    "Nominal Naik Turun Golongan",
+    "Nominal Pinbuk",
+]
 
 
 @dataclass
@@ -102,16 +111,18 @@ def normalize_invoice_number(value: Any) -> str | None:
     if isinstance(value, (int, np.integer)):
         return str(int(value))
 
-    if isinstance(value, (float, np.floating)):
-        if float(value).is_integer():
-            return str(int(value))
+    if isinstance(value, (float, np.floating)) and float(value).is_integer():
+        return str(int(value))
 
     text = str(value).strip().upper()
     text = re.sub(r"\s+", "", text)
+
     if text in {"", "NAN", "NONE", "-"}:
         return None
+
     if re.fullmatch(r"\d+\.0", text):
         text = text[:-2]
+
     return text
 
 
@@ -188,14 +199,14 @@ def detect_column(columns: list[str], candidates: list[str]) -> str | None:
     normalized_candidates = [normalize_header(c) for c in candidates]
 
     for candidate in normalized_candidates:
-        for column in normalized_columns:
+        for index, column in enumerate(normalized_columns):
             if column == candidate:
-                return column
+                return columns[index]
 
     for candidate in normalized_candidates:
-        for column in normalized_columns:
+        for index, column in enumerate(normalized_columns):
             if candidate in column:
-                return column
+                return columns[index]
 
     return None
 
@@ -234,10 +245,12 @@ def parse_datetime_series(series: pd.Series) -> pd.Series:
         "%Y/%m/%d %H:%M",
     ]
     as_text = series.astype(str)
+
     for fmt in formats:
         parsed = pd.to_datetime(as_text, format=fmt, errors="coerce")
         if parsed.notna().sum() > 0:
             return parsed
+
     return pd.to_datetime(as_text, errors="coerce")
 
 
@@ -265,6 +278,13 @@ def exact_date_time_window_mask(
 
 def base_result() -> pd.Series:
     return pd.Series(0.0, index=DEFAULT_PORTS, dtype=float)
+
+
+def append_total_row(df: pd.DataFrame, label_col: str, numeric_columns: list[str]) -> pd.DataFrame:
+    total_row = {label_col: "TOTAL"}
+    for col in numeric_columns:
+        total_row[col] = df[col].sum() if col in df.columns else 0.0
+    return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
 
 
 def read_uploaded_file(uploaded_file: Any) -> dict[str, pd.DataFrame]:
@@ -308,12 +328,15 @@ def load_multiple_files(uploaded_files: list[Any]) -> tuple[dict[str, pd.DataFra
 
 def combine_selected_sheets(sheet_map: dict[str, pd.DataFrame], selected_keys: list[str]) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
+
     for key in selected_keys:
         df = sheet_map[key].copy()
         df["__SOURCE__"] = key
         frames.append(df)
+
     if not frames:
         return pd.DataFrame()
+
     return pd.concat(frames, ignore_index=True, sort=False)
 
 
@@ -441,6 +464,7 @@ def aggregate_summary_by_invoice(
             }
         )
     )
+
     return grouped, warnings
 
 
@@ -507,6 +531,7 @@ def aggregate_invoice_by_invoice(
             }
         )
     )
+
     return grouped, warnings
 
 
@@ -599,6 +624,7 @@ def extract_ticket_sold_structured(df: pd.DataFrame) -> AggregateResult:
     )
 
     selector = work[subtotal_mask].copy() if subtotal_mask.any() else work.copy()
+
     selected = (
         selector.sort_values(["__SOURCE__", "__PORT__", "__ROW_NO__"])
         .groupby(["__SOURCE__", "__PORT__"], as_index=False)
@@ -617,6 +643,7 @@ def extract_ticket_sold_structured(df: pd.DataFrame) -> AggregateResult:
             "__SOURCE__": "SUMBER_FILE_SHEET",
         }
     )
+
     return AggregateResult(result, detail, warnings)
 
 
@@ -632,6 +659,7 @@ def extract_ticket_sold_report_style(df: pd.DataFrame) -> AggregateResult:
     for idx, row in df.iterrows():
         source = row.get("__SOURCE__", "")
         current_port = current_port_by_source.get(source)
+
         row_values = row.tolist()
         row_text = " | ".join("" if pd.isna(v) else str(v) for v in row_values)
         normalized_row = normalize_text(row_text)
@@ -684,11 +712,7 @@ def extract_ticket_sold_report_style(df: pd.DataFrame) -> AggregateResult:
         ascending=[True, True, False, False],
     )
 
-    selected = (
-        candidate_df.groupby(["SOURCE", "PELABUHAN"], as_index=False)
-        .head(1)
-        .reset_index(drop=True)
-    )
+    selected = candidate_df.groupby(["SOURCE", "PELABUHAN"], as_index=False).head(1).reset_index(drop=True)
 
     grouped = selected.groupby("PELABUHAN")["NOMINAL"].sum()
     result = base_result().add(grouped, fill_value=0.0)
@@ -696,6 +720,7 @@ def extract_ticket_sold_report_style(df: pd.DataFrame) -> AggregateResult:
     detail = selected[
         ["SUMBER_FILE_SHEET", "PELABUHAN", "NOMINAL", "PRIORITY", "ROW_INDEX", "BARIS_SUMBER"]
     ]
+
     return AggregateResult(result, detail, warnings)
 
 
@@ -765,11 +790,18 @@ def format_currency_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFram
 
 
 def to_excel_bytes(reconciliation_df: pd.DataFrame, detail_tables: dict[str, pd.DataFrame]) -> bytes:
+    export_df = append_total_row(
+        reconciliation_df,
+        label_col="Pelabuhan (ASAL)",
+        numeric_columns=NUMERIC_COLUMNS,
+    )
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        reconciliation_df.to_excel(writer, index=False, sheet_name="Rekonsiliasi")
+        export_df.to_excel(writer, index=False, sheet_name="Rekonsiliasi")
         for name, detail_df in detail_tables.items():
             detail_df.to_excel(writer, index=False, sheet_name=name[:31])
+
     output.seek(0)
     return output.getvalue()
 
@@ -799,6 +831,7 @@ def file_section(label: str, key_prefix: str) -> tuple[dict[str, pd.DataFrame] |
         default=options,
         key=f"{key_prefix}_selected",
     )
+
     return sheet_map, selected
 
 
@@ -844,10 +877,10 @@ def render_validation(summary_df: pd.DataFrame, invoice_df: pd.DataFrame) -> Non
 st.set_page_config(page_title="Rekonsiliasi Sales Channel", layout="wide")
 st.title("Rekonsiliasi Sales Channel")
 st.caption(
-    "Aturan aktif: "
     "Penambahan/Pengurangan = Tiket Summary[`CETAK BOARDING PASS`, `Tarif`] pada jam 00:00:00-07:59:59 | "
     "Naik Turun Golongan = compare per Nomor Invoice antara Invoice[`Tanggal Invoice`, `Harga`] "
-    "vs Tiket Summary[`Tanggal Pembayaran`, `Tarif`]."
+    "vs Tiket Summary[`Tanggal Pembayaran`, `Tarif`] | "
+    "Baris TOTAL ada di tabel yang sama."
 )
 
 with st.sidebar:
@@ -906,29 +939,17 @@ else:
         ntg_end_date=ntg_end_date,
     )
 
-    numeric_columns = [
-        "Nominal Tiket Terjual",
-        "Nominal Penambahan",
-        "Nominal Pengurangan",
-        "Nominal Naik Turun Golongan",
-        "Nominal Pinbuk",
-    ]
+    display_df = append_total_row(
+        reconciliation_df,
+        label_col="Pelabuhan (ASAL)",
+        numeric_columns=NUMERIC_COLUMNS,
+    )
 
     st.subheader("Tabel Rekonsiliasi Sales Channel")
     st.dataframe(
-        format_currency_columns(reconciliation_df, numeric_columns),
+        format_currency_columns(display_df, NUMERIC_COLUMNS),
         use_container_width=True,
-        height=360,
-    )
-
-    total_row = reconciliation_df[numeric_columns].sum().to_frame().T
-    total_row.insert(0, "Pelabuhan (ASAL)", "TOTAL")
-
-    st.subheader("Grand Total")
-    st.dataframe(
-        format_currency_columns(total_row, numeric_columns),
-        use_container_width=True,
-        hide_index=True,
+        height=440,
     )
 
     if warnings_list:
