@@ -287,14 +287,20 @@ def append_total_row(df: pd.DataFrame, label_col: str, numeric_columns: list[str
     return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
 
 
-def read_uploaded_file(uploaded_file: Any) -> dict[str, pd.DataFrame]:
+def read_uploaded_file_first_sheet(uploaded_file: Any) -> pd.DataFrame:
     file_name = uploaded_file.name.lower()
     content = uploaded_file.getvalue()
     buffer = io.BytesIO(content)
 
     if file_name.endswith((".xlsx", ".xls", ".xlsm")):
-        raw = pd.read_excel(buffer, sheet_name=None, dtype=object)
-        return {sheet_name: prepare_dataframe(df) for sheet_name, df in raw.items()}
+        excel_file = pd.ExcelFile(buffer)
+        first_sheet = excel_file.sheet_names[0]
+        df = pd.read_excel(excel_file, sheet_name=first_sheet, dtype=object)
+        result = prepare_dataframe(df)
+        result["__FILE__"] = uploaded_file.name
+        result["__SHEET__"] = first_sheet
+        result["__SOURCE__"] = f"{uploaded_file.name} :: {first_sheet}"
+        return result
 
     if file_name.endswith(".csv"):
         try:
@@ -302,42 +308,29 @@ def read_uploaded_file(uploaded_file: Any) -> dict[str, pd.DataFrame]:
         except Exception:
             buffer.seek(0)
             df = pd.read_csv(buffer, dtype=object, sep=";")
-        return {"CSV": prepare_dataframe(df)}
+        result = prepare_dataframe(df)
+        result["__FILE__"] = uploaded_file.name
+        result["__SHEET__"] = "CSV"
+        result["__SOURCE__"] = f"{uploaded_file.name} :: CSV"
+        return result
 
     raise ValueError("Format file tidak didukung. Gunakan Excel atau CSV.")
 
 
-def load_multiple_files(uploaded_files: list[Any]) -> tuple[dict[str, pd.DataFrame], list[str]]:
-    sheet_map: dict[str, pd.DataFrame] = {}
+def load_multiple_files_first_sheet(uploaded_files: list[Any]) -> tuple[pd.DataFrame, list[str]]:
+    frames: list[pd.DataFrame] = []
     errors: list[str] = []
 
     for uploaded_file in uploaded_files:
         try:
-            file_sheets = read_uploaded_file(uploaded_file)
-            for sheet_name, df in file_sheets.items():
-                key = f"{uploaded_file.name} :: {sheet_name}"
-                df_copy = df.copy()
-                df_copy["__FILE__"] = uploaded_file.name
-                df_copy["__SHEET__"] = sheet_name
-                sheet_map[key] = df_copy
+            frames.append(read_uploaded_file_first_sheet(uploaded_file))
         except Exception as exc:
             errors.append(f"{uploaded_file.name}: {exc}")
 
-    return sheet_map, errors
-
-
-def combine_selected_sheets(sheet_map: dict[str, pd.DataFrame], selected_keys: list[str]) -> pd.DataFrame:
-    frames: list[pd.DataFrame] = []
-
-    for key in selected_keys:
-        df = sheet_map[key].copy()
-        df["__SOURCE__"] = key
-        frames.append(df)
-
     if not frames:
-        return pd.DataFrame()
+        return pd.DataFrame(), errors
 
-    return pd.concat(frames, ignore_index=True, sort=False)
+    return pd.concat(frames, ignore_index=True, sort=False), errors
 
 
 def aggregate_summary_window(df: pd.DataFrame, target_date: date) -> AggregateResult:
@@ -559,39 +552,14 @@ def aggregate_naik_turun_golongan(
             warnings or ["Tidak ada data Naik Turun Golongan yang bisa dibandingkan."],
         )
 
-    merged["ADA_DI_INVOICE"] = merged["NOMINAL_INVOICE"].notna()
-    merged["ADA_DI_TIKET_SUMMARY"] = merged["NOMINAL_TIKET_SUMMARY"].notna()
     merged["NOMINAL_INVOICE"] = merged["NOMINAL_INVOICE"].fillna(0.0)
     merged["NOMINAL_TIKET_SUMMARY"] = merged["NOMINAL_TIKET_SUMMARY"].fillna(0.0)
     merged["SELISIH"] = merged["NOMINAL_INVOICE"] - merged["NOMINAL_TIKET_SUMMARY"]
-    merged["STATUS"] = np.select(
-        [
-            merged["ADA_DI_INVOICE"] & merged["ADA_DI_TIKET_SUMMARY"],
-            merged["ADA_DI_INVOICE"] & ~merged["ADA_DI_TIKET_SUMMARY"],
-            ~merged["ADA_DI_INVOICE"] & merged["ADA_DI_TIKET_SUMMARY"],
-        ],
-        [
-            "MATCHED",
-            "HANYA_DI_INVOICE",
-            "HANYA_DI_TIKET_SUMMARY",
-        ],
-        default="UNKNOWN",
-    )
 
     grouped = merged.groupby("PELABUHAN")["SELISIH"].sum()
     result = base_result().add(grouped, fill_value=0.0)
 
-    detail = merged[
-        [
-            "PELABUHAN",
-            "NOMOR_INVOICE",
-            "NOMINAL_INVOICE",
-            "NOMINAL_TIKET_SUMMARY",
-            "SELISIH",
-            "STATUS",
-        ]
-    ].sort_values(["PELABUHAN", "NOMOR_INVOICE"]).reset_index(drop=True)
-
+    detail = merged.sort_values(["PELABUHAN", "NOMOR_INVOICE"]).reset_index(drop=True)
     return AggregateResult(result, detail, warnings)
 
 
@@ -744,18 +712,11 @@ def build_reconciliation(
     deduction_date: date,
     ntg_start_date: date,
     ntg_end_date: date,
-) -> tuple[pd.DataFrame, list[str]]:
-    warnings: list[str] = []
-
+) -> pd.DataFrame:
     ticket_sold = extract_ticket_sold_totals(ticket_sold_df)
     addition = aggregate_summary_window(ticket_summary_df, addition_date)
     deduction = aggregate_summary_window(ticket_summary_df, deduction_date)
     naik_turun = aggregate_naik_turun_golongan(invoice_df, ticket_summary_df, ntg_start_date, ntg_end_date)
-
-    warnings.extend(ticket_sold.warnings)
-    warnings.extend(addition.warnings)
-    warnings.extend(deduction.warnings)
-    warnings.extend(naik_turun.warnings)
 
     result = pd.DataFrame({"Pelabuhan (ASAL)": DEFAULT_PORTS})
     result["Nominal Tiket Terjual"] = result["Pelabuhan (ASAL)"].map(ticket_sold.series).fillna(0.0)
@@ -769,13 +730,11 @@ def build_reconciliation(
         + result["Nominal Naik Turun Golongan"]
     )
 
-    result = append_total_row(
+    return append_total_row(
         result,
         label_col="Pelabuhan (ASAL)",
         numeric_columns=NUMERIC_COLUMNS,
     )
-
-    return result, list(dict.fromkeys(warnings))
 
 
 def format_currency_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -788,7 +747,25 @@ def format_currency_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFram
     return result
 
 
-def file_section(label: str, key_prefix: str) -> tuple[dict[str, pd.DataFrame] | None, list[str]]:
+def empty_reconciliation_table() -> pd.DataFrame:
+    empty_df = pd.DataFrame(
+        {
+            "Pelabuhan (ASAL)": DEFAULT_PORTS,
+            "Nominal Tiket Terjual": [0.0] * len(DEFAULT_PORTS),
+            "Nominal Penambahan": [0.0] * len(DEFAULT_PORTS),
+            "Nominal Pengurangan": [0.0] * len(DEFAULT_PORTS),
+            "Nominal Naik Turun Golongan": [0.0] * len(DEFAULT_PORTS),
+            "Nominal Pinbuk": [0.0] * len(DEFAULT_PORTS),
+        }
+    )
+    return append_total_row(
+        empty_df,
+        label_col="Pelabuhan (ASAL)",
+        numeric_columns=NUMERIC_COLUMNS,
+    )
+
+
+def uploader_first_sheet(label: str, key_prefix: str) -> pd.DataFrame:
     uploaded_files = st.sidebar.file_uploader(
         label,
         type=["xlsx", "xls", "xlsm", "csv"],
@@ -797,21 +774,10 @@ def file_section(label: str, key_prefix: str) -> tuple[dict[str, pd.DataFrame] |
     )
 
     if not uploaded_files:
-        return None, []
+        return pd.DataFrame()
 
-    sheet_map, _ = load_multiple_files(uploaded_files)
-    if not sheet_map:
-        return None, []
-
-    options = list(sheet_map.keys())
-    selected = st.sidebar.multiselect(
-        f"Pilih file/sheet {label}",
-        options=options,
-        default=options,
-        key=f"{key_prefix}_selected",
-    )
-
-    return sheet_map, selected
+    combined_df, _errors = load_multiple_files_first_sheet(uploaded_files)
+    return combined_df
 
 
 st.set_page_config(page_title="Rekonsiliasi Sales Channel", layout="wide")
@@ -825,28 +791,16 @@ with st.sidebar:
     ntg_end_date = st.date_input("Tanggal NTG - Selesai", value=date.today(), key="ntg_end_date")
     st.divider()
     st.subheader("Uploader")
+    st.caption("Excel otomatis memakai sheet 1.")
 
-ticket_sold_map, ticket_sold_selected = file_section("Tiket Terjual", "ticket_sold")
-ticket_summary_map, ticket_summary_selected = file_section("Tiket Summary", "ticket_summary")
-invoice_map, invoice_selected = file_section("Invoice", "invoice")
+ticket_sold_df = uploader_first_sheet("Tiket Terjual", "ticket_sold")
+ticket_summary_df = uploader_first_sheet("Tiket Summary", "ticket_summary")
+invoice_df = uploader_first_sheet("Invoice", "invoice")
 
-ticket_sold_df = combine_selected_sheets(ticket_sold_map, ticket_sold_selected) if ticket_sold_map and ticket_sold_selected else pd.DataFrame()
-ticket_summary_df = combine_selected_sheets(ticket_summary_map, ticket_summary_selected) if ticket_summary_map and ticket_summary_selected else pd.DataFrame()
-invoice_df = combine_selected_sheets(invoice_map, invoice_selected) if invoice_map and invoice_selected else pd.DataFrame()
-
-ready = all(
-    [
-        ticket_sold_map is not None,
-        ticket_summary_map is not None,
-        invoice_map is not None,
-        len(ticket_sold_selected) > 0,
-        len(ticket_summary_selected) > 0,
-        len(invoice_selected) > 0,
-    ]
-)
+ready = not ticket_sold_df.empty and not ticket_summary_df.empty and not invoice_df.empty
 
 if ready:
-    reconciliation_df, _warnings = build_reconciliation(
+    reconciliation_df = build_reconciliation(
         ticket_sold_df=ticket_sold_df,
         ticket_summary_df=ticket_summary_df,
         invoice_df=invoice_df,
@@ -855,31 +809,11 @@ if ready:
         ntg_start_date=ntg_start_date,
         ntg_end_date=ntg_end_date,
     )
-
-    st.dataframe(
-        format_currency_columns(reconciliation_df, NUMERIC_COLUMNS),
-        use_container_width=True,
-        height=420,
-    )
 else:
-    st.dataframe(
-        format_currency_columns(
-            append_total_row(
-                pd.DataFrame(
-                    {
-                        "Pelabuhan (ASAL)": DEFAULT_PORTS,
-                        "Nominal Tiket Terjual": [0.0] * len(DEFAULT_PORTS),
-                        "Nominal Penambahan": [0.0] * len(DEFAULT_PORTS),
-                        "Nominal Pengurangan": [0.0] * len(DEFAULT_PORTS),
-                        "Nominal Naik Turun Golongan": [0.0] * len(DEFAULT_PORTS),
-                        "Nominal Pinbuk": [0.0] * len(DEFAULT_PORTS),
-                    }
-                ),
-                label_col="Pelabuhan (ASAL)",
-                numeric_columns=NUMERIC_COLUMNS,
-            ),
-            NUMERIC_COLUMNS,
-        ),
-        use_container_width=True,
-        height=420,
-    )
+    reconciliation_df = empty_reconciliation_table()
+
+st.dataframe(
+    format_currency_columns(reconciliation_df, NUMERIC_COLUMNS),
+    use_container_width=True,
+    height=420,
+)
