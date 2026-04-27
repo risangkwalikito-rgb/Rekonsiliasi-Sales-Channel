@@ -704,6 +704,16 @@ def extract_ticket_sold_totals(df: pd.DataFrame) -> AggregateResult:
     return AggregateResult(base_result(), pd.DataFrame(), structured.warnings + fallback.warnings)
 
 
+def normalize_date_range_input(value: Any) -> tuple[date, date]:
+    if isinstance(value, tuple) and len(value) == 2:
+        return value[0], value[1]
+    if isinstance(value, list) and len(value) == 2:
+        return value[0], value[1]
+    if isinstance(value, (tuple, list)) and len(value) == 1:
+        return value[0], value[0]
+    return value, value
+
+
 def build_reconciliation(
     ticket_sold_df: pd.DataFrame,
     ticket_summary_df: pd.DataFrame,
@@ -783,15 +793,28 @@ def uploader_first_sheet(label: str, key_prefix: str) -> pd.DataFrame:
 st.set_page_config(page_title="Rekonsiliasi Sales Channel", layout="wide")
 st.title("Rekonsiliasi Sales Channel")
 
+today = date.today()
+
 with st.sidebar:
     st.subheader("Parameter")
-    addition_date = st.date_input("Tanggal Penambahan", value=date.today(), key="addition_date")
-    deduction_date = st.date_input("Tanggal Pengurangan", value=date.today(), key="deduction_date")
-    ntg_start_date = st.date_input("Tanggal NTG - Mulai", value=date.today(), key="ntg_start_date")
-    ntg_end_date = st.date_input("Tanggal NTG - Selesai", value=date.today(), key="ntg_end_date")
+
+    penambahan_pengurangan_range = st.date_input(
+        "Rentang Penambahan / Pengurangan",
+        value=(today, today),
+        key="penambahan_pengurangan_range",
+    )
+    ntg_range = st.date_input(
+        "Rentang Naik Turun Golongan",
+        value=(today, today),
+        key="ntg_range",
+    )
+
     st.divider()
     st.subheader("Uploader")
     st.caption("Excel otomatis memakai sheet 1.")
+
+addition_date, deduction_date = normalize_date_range_input(penambahan_pengurangan_range)
+ntg_start_date, ntg_end_date = normalize_date_range_input(ntg_range)
 
 ticket_sold_df = uploader_first_sheet("Tiket Terjual", "ticket_sold")
 ticket_summary_df = uploader_first_sheet("Tiket Summary", "ticket_summary")
