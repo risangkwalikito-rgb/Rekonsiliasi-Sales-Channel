@@ -1,9 +1,9 @@
-# app.py
+# file: app.py
 
 import io
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time
 from typing import Any, Iterable
 
 import numpy as np
@@ -86,6 +86,9 @@ AMOUNT_CANDIDATES_TICKET = [
     "AMOUNT",
     "JUMLAH",
 ]
+
+DEFAULT_TIME_WINDOW_START = "00:00:00"
+DEFAULT_TIME_WINDOW_END = "07:59:59"
 
 
 @dataclass
@@ -208,12 +211,23 @@ def parse_datetime_series(series: pd.Series) -> pd.Series:
     if parsed.notna().sum() > 0:
         return parsed
 
-    formats = ["%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y %H:%M:%S"]
+    formats = [
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%d/%m/%Y %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%d-%m-%Y %H:%M:%S",
+        "%Y/%m/%d",
+    ]
     text_series = series.astype(str)
     for fmt in formats:
         parsed = pd.to_datetime(text_series, format=fmt, errors="coerce")
         if parsed.notna().sum() > 0:
             return parsed
+
     return pd.to_datetime(series.astype(str), errors="coerce")
 
 
@@ -225,6 +239,7 @@ def exact_date_mask(series: pd.Series, target_date: date) -> pd.Series:
     text = series.astype(str).str.upper()
     patterns = [
         target_date.strftime("%Y-%m-%d"),
+        target_date.strftime("%Y/%m/%d"),
         target_date.strftime("%d/%m/%Y"),
         target_date.strftime("%d-%m-%Y"),
         target_date.strftime("%m/%d/%Y"),
@@ -241,6 +256,28 @@ def between_date_mask(series: pd.Series, start_date: date, end_date: date) -> pd
     if parsed.notna().sum() == 0:
         return pd.Series(True, index=series.index)
     return (parsed.dt.date >= start_date) & (parsed.dt.date <= end_date)
+
+
+def parse_time_value(value: str) -> time:
+    return datetime.strptime(value, "%H:%M:%S").time()
+
+
+def exact_date_time_window_mask(
+    series: pd.Series,
+    target_date: date,
+    window_start: str,
+    window_end: str,
+) -> pd.Series:
+    parsed = parse_datetime_series(series)
+    if parsed.notna().sum() == 0:
+        return pd.Series(False, index=series.index)
+
+    start_time = parse_time_value(window_start)
+    end_time = parse_time_value(window_end)
+
+    date_match = parsed.dt.date == target_date
+    time_match = (parsed.dt.time >= start_time) & (parsed.dt.time <= end_time)
+    return date_match & time_match
 
 
 def read_uploaded_file(uploaded_file: Any) -> dict[str, pd.DataFrame]:
@@ -278,7 +315,12 @@ def base_result() -> pd.Series:
     return pd.Series(0.0, index=DEFAULT_PORTS, dtype=float)
 
 
-def aggregate_summary_exact_date(df: pd.DataFrame, target_date: date) -> AggregateResult:
+def aggregate_summary_exact_datetime_window(
+    df: pd.DataFrame,
+    target_date: date,
+    window_start: str = DEFAULT_TIME_WINDOW_START,
+    window_end: str = DEFAULT_TIME_WINDOW_END,
+) -> AggregateResult:
     warnings: list[str] = []
     if df.empty:
         return AggregateResult(base_result(), pd.DataFrame(), ["File Tiket Summary kosong."])
@@ -297,9 +339,15 @@ def aggregate_summary_exact_date(df: pd.DataFrame, target_date: date) -> Aggrega
     work = df.copy()
     work["__PORT__"] = work[port_col].apply(canonical_port)
     work["__AMOUNT__"] = work[amount_col].apply(parse_number)
-    work = work[work["__PORT__"].notna() & work["__AMOUNT__"].notna()].copy()
+    work["__DATETIME__"] = parse_datetime_series(work[date_col])
 
-    mask = exact_date_mask(work[date_col], target_date)
+    work = work[
+        work["__PORT__"].notna()
+        & work["__AMOUNT__"].notna()
+        & work["__DATETIME__"].notna()
+    ].copy()
+
+    mask = exact_date_time_window_mask(work[date_col], target_date, window_start, window_end)
     work = work[mask].copy()
 
     grouped = work.groupby("__PORT__")["__AMOUNT__"].sum()
@@ -307,7 +355,7 @@ def aggregate_summary_exact_date(df: pd.DataFrame, target_date: date) -> Aggrega
 
     detail = work[[date_col, port_col, amount_col, "__PORT__", "__AMOUNT__", "__SOURCE__"]].rename(
         columns={
-            date_col: "TANGGAL_SUMMARY",
+            date_col: "CETAK_BOARDING_PASS",
             port_col: "ASAL_SUMBER",
             amount_col: "NOMINAL_SUMBER",
             "__PORT__": "PELABUHAN",
@@ -315,8 +363,13 @@ def aggregate_summary_exact_date(df: pd.DataFrame, target_date: date) -> Aggrega
             "__SOURCE__": "SUMBER_FILE_SHEET",
         }
     )
+
     if detail.empty:
-        warnings.append(f"Tidak ada data Tiket Summary untuk tanggal {target_date.strftime('%d-%m-%Y')}.")
+        warnings.append(
+            "Tidak ada data Tiket Summary untuk "
+            f"tanggal {target_date.strftime('%Y/%m/%d')} "
+            f"jam {window_start} - {window_end}."
+        )
 
     return AggregateResult(result, detail, warnings)
 
@@ -569,12 +622,26 @@ def build_reconciliation(
     summary_end_date: date,
     ntg_start_date: date,
     ntg_end_date: date,
+    addition_window_start: str,
+    addition_window_end: str,
+    deduction_window_start: str,
+    deduction_window_end: str,
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], list[str]]:
     warnings: list[str] = []
 
     ticket_sold = extract_ticket_sold_totals(ticket_sold_df)
-    addition = aggregate_summary_exact_date(ticket_summary_df, summary_start_date)
-    deduction = aggregate_summary_exact_date(ticket_summary_df, summary_end_date)
+    addition = aggregate_summary_exact_datetime_window(
+        ticket_summary_df,
+        summary_start_date,
+        addition_window_start,
+        addition_window_end,
+    )
+    deduction = aggregate_summary_exact_datetime_window(
+        ticket_summary_df,
+        summary_end_date,
+        deduction_window_start,
+        deduction_window_end,
+    )
     summary_range = aggregate_summary_range(ticket_summary_df, ntg_start_date, ntg_end_date)
     invoice_range = aggregate_invoice_range(invoice_df, ntg_start_date, ntg_end_date)
 
@@ -688,19 +755,62 @@ st.set_page_config(page_title="Rekonsiliasi Sales Channel", layout="wide")
 st.title("Rekonsiliasi Sales Channel")
 st.caption(
     "Setiap uploader bisa upload banyak file Excel/CSV. "
-    "Pilih file/sheet yang ingin digabung untuk perhitungan rekonsiliasi."
+    "Nominal Penambahan dan Pengurangan difilter dari CETAK BOARDING PASS sesuai tanggal parameter "
+    "dan window jam yang dipilih."
 )
 
 with st.sidebar:
     st.subheader("Parameter")
-    summary_start_date = st.date_input("Tanggal Penambahan (T-Summary awal)", value=date.today(), key="summary_start_date")
-    summary_end_date = st.date_input("Tanggal Pengurangan (T-Summary akhir)", value=date.today(), key="summary_end_date")
+
+    summary_start_date = st.date_input(
+        "Tanggal Penambahan",
+        value=date.today(),
+        key="summary_start_date",
+    )
+    addition_window = st.text_input(
+        "Jam Penambahan (format: HH:MM:SS - HH:MM:SS)",
+        value=f"{DEFAULT_TIME_WINDOW_START} - {DEFAULT_TIME_WINDOW_END}",
+        key="addition_window",
+    )
+
+    summary_end_date = st.date_input(
+        "Tanggal Pengurangan",
+        value=date.today(),
+        key="summary_end_date",
+    )
+    deduction_window = st.text_input(
+        "Jam Pengurangan (format: HH:MM:SS - HH:MM:SS)",
+        value=f"{DEFAULT_TIME_WINDOW_START} - {DEFAULT_TIME_WINDOW_END}",
+        key="deduction_window",
+    )
+
     ntg_start_date = st.date_input("Tanggal Naik Turun Golongan - Mulai", value=date.today(), key="ntg_start_date")
     ntg_end_date = st.date_input("Tanggal Naik Turun Golongan - Selesai", value=date.today(), key="ntg_end_date")
 
     st.markdown("---")
     st.write("Pelabuhan default:")
     st.write(", ".join(DEFAULT_PORTS))
+
+def split_window_input(value: str, default_start: str, default_end: str) -> tuple[str, str]:
+    try:
+        start_value, end_value = [part.strip() for part in value.split("-", 1)]
+        parse_time_value(start_value)
+        parse_time_value(end_value)
+        return start_value, end_value
+    except Exception:
+        return default_start, default_end
+
+
+addition_window_start, addition_window_end = split_window_input(
+    addition_window,
+    DEFAULT_TIME_WINDOW_START,
+    DEFAULT_TIME_WINDOW_END,
+)
+deduction_window_start, deduction_window_end = split_window_input(
+    deduction_window,
+    DEFAULT_TIME_WINDOW_START,
+    DEFAULT_TIME_WINDOW_END,
+)
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -736,6 +846,10 @@ else:
         summary_end_date=summary_end_date,
         ntg_start_date=ntg_start_date,
         ntg_end_date=ntg_end_date,
+        addition_window_start=addition_window_start,
+        addition_window_end=addition_window_end,
+        deduction_window_start=deduction_window_start,
+        deduction_window_end=deduction_window_end,
     )
 
     numeric_columns = [
@@ -747,6 +861,10 @@ else:
     ]
 
     st.subheader("Tabel Rekonsiliasi Sales Channel")
+    st.caption(
+        f"Penambahan: {summary_start_date.strftime('%Y/%m/%d')} {addition_window_start} - {addition_window_end} | "
+        f"Pengurangan: {summary_end_date.strftime('%Y/%m/%d')} {deduction_window_start} - {deduction_window_end}"
+    )
     st.dataframe(format_currency_columns(reconciliation_df, numeric_columns), use_container_width=True, height=360)
 
     total_row = reconciliation_df[numeric_columns].sum().to_frame().T
