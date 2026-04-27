@@ -744,7 +744,7 @@ def build_reconciliation(
     deduction_date: date,
     ntg_start_date: date,
     ntg_end_date: date,
-) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], list[str]]:
+) -> tuple[pd.DataFrame, list[str]]:
     warnings: list[str] = []
 
     ticket_sold = extract_ticket_sold_totals(ticket_sold_df)
@@ -769,14 +769,13 @@ def build_reconciliation(
         + result["Nominal Naik Turun Golongan"]
     )
 
-    details = {
-        "tiket_terjual": ticket_sold.detail,
-        "penambahan": addition.detail,
-        "pengurangan": deduction.detail,
-        "naik_turun_golongan": naik_turun.detail,
-    }
+    result = append_total_row(
+        result,
+        label_col="Pelabuhan (ASAL)",
+        numeric_columns=NUMERIC_COLUMNS,
+    )
 
-    return result, details, list(dict.fromkeys(warnings))
+    return result, list(dict.fromkeys(warnings))
 
 
 def format_currency_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -789,25 +788,8 @@ def format_currency_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFram
     return result
 
 
-def to_excel_bytes(reconciliation_df: pd.DataFrame, detail_tables: dict[str, pd.DataFrame]) -> bytes:
-    export_df = append_total_row(
-        reconciliation_df,
-        label_col="Pelabuhan (ASAL)",
-        numeric_columns=NUMERIC_COLUMNS,
-    )
-
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        export_df.to_excel(writer, index=False, sheet_name="Rekonsiliasi")
-        for name, detail_df in detail_tables.items():
-            detail_df.to_excel(writer, index=False, sheet_name=name[:31])
-
-    output.seek(0)
-    return output.getvalue()
-
-
 def file_section(label: str, key_prefix: str) -> tuple[dict[str, pd.DataFrame] | None, list[str]]:
-    uploaded_files = st.file_uploader(
+    uploaded_files = st.sidebar.file_uploader(
         label,
         type=["xlsx", "xls", "xlsm", "csv"],
         accept_multiple_files=True,
@@ -817,16 +799,13 @@ def file_section(label: str, key_prefix: str) -> tuple[dict[str, pd.DataFrame] |
     if not uploaded_files:
         return None, []
 
-    sheet_map, errors = load_multiple_files(uploaded_files)
-    for error in errors:
-        st.error(f"Gagal membaca {label}: {error}")
-
+    sheet_map, _ = load_multiple_files(uploaded_files)
     if not sheet_map:
         return None, []
 
     options = list(sheet_map.keys())
-    selected = st.multiselect(
-        f"Pilih file/sheet untuk {label}",
+    selected = st.sidebar.multiselect(
+        f"Pilih file/sheet {label}",
         options=options,
         default=options,
         key=f"{key_prefix}_selected",
@@ -835,85 +814,25 @@ def file_section(label: str, key_prefix: str) -> tuple[dict[str, pd.DataFrame] |
     return sheet_map, selected
 
 
-def render_preview(name: str, sheet_map: dict[str, pd.DataFrame] | None, selected: list[str]) -> pd.DataFrame:
-    if not sheet_map or not selected:
-        return pd.DataFrame()
-
-    combined = combine_selected_sheets(sheet_map, selected)
-    file_count = combined["__FILE__"].nunique() if "__FILE__" in combined.columns else 0
-
-    with st.expander(f"Preview {name}", expanded=False):
-        st.caption(
-            f"{file_count} file | {len(selected)} file/sheet dipilih | "
-            f"{combined.shape[0]} baris | {combined.shape[1]} kolom"
-        )
-        st.dataframe(combined.head(30), use_container_width=True, height=280)
-        st.write("Kolom:", list(combined.columns))
-
-    return combined
-
-
-def render_validation(summary_df: pd.DataFrame, invoice_df: pd.DataFrame) -> None:
-    with st.expander("Validasi kolom wajib", expanded=False):
-        summary_required = [SUMMARY_BP_DATE_COL, SUMMARY_PAYMENT_DATE_COL, SUMMARY_AMOUNT_COL]
-        invoice_required = [INVOICE_DATE_COL, INVOICE_AMOUNT_COL]
-
-        summary_found = [col for col in summary_required if require_column(summary_df, col)]
-        summary_missing = [col for col in summary_required if not require_column(summary_df, col)]
-        invoice_found = [col for col in invoice_required if require_column(invoice_df, col)]
-        invoice_missing = [col for col in invoice_required if not require_column(invoice_df, col)]
-
-        summary_invoice_col = detect_invoice_no_column(summary_df)
-        invoice_invoice_col = detect_invoice_no_column(invoice_df)
-
-        st.write("Tiket Summary ditemukan:", summary_found or "-")
-        st.write("Tiket Summary belum ada:", summary_missing or "-")
-        st.write("Tiket Summary Nomor Invoice:", summary_invoice_col or "BELUM DITEMUKAN")
-        st.write("Invoice ditemukan:", invoice_found or "-")
-        st.write("Invoice belum ada:", invoice_missing or "-")
-        st.write("Invoice Nomor Invoice:", invoice_invoice_col or "BELUM DITEMUKAN")
-
-
 st.set_page_config(page_title="Rekonsiliasi Sales Channel", layout="wide")
 st.title("Rekonsiliasi Sales Channel")
-st.caption(
-    "Penambahan/Pengurangan = Tiket Summary[`CETAK BOARDING PASS`, `Tarif`] pada jam 00:00:00-07:59:59 | "
-    "Naik Turun Golongan = compare per Nomor Invoice antara Invoice[`Tanggal Invoice`, `Harga`] "
-    "vs Tiket Summary[`Tanggal Pembayaran`, `Tarif`] | "
-    "Baris TOTAL ada di tabel yang sama."
-)
 
 with st.sidebar:
     st.subheader("Parameter")
     addition_date = st.date_input("Tanggal Penambahan", value=date.today(), key="addition_date")
     deduction_date = st.date_input("Tanggal Pengurangan", value=date.today(), key="deduction_date")
-    ntg_start_date = st.date_input("Tanggal Naik Turun Golongan - Mulai", value=date.today(), key="ntg_start_date")
-    ntg_end_date = st.date_input("Tanggal Naik Turun Golongan - Selesai", value=date.today(), key="ntg_end_date")
+    ntg_start_date = st.date_input("Tanggal NTG - Mulai", value=date.today(), key="ntg_start_date")
+    ntg_end_date = st.date_input("Tanggal NTG - Selesai", value=date.today(), key="ntg_end_date")
+    st.divider()
+    st.subheader("Uploader")
 
-    st.markdown("---")
-    st.write("Window Penambahan/Pengurangan:")
-    st.write(f"{WINDOW_START} - {WINDOW_END}")
-    st.markdown("---")
-    st.write("Pelabuhan default:")
-    st.write(", ".join(DEFAULT_PORTS))
+ticket_sold_map, ticket_sold_selected = file_section("Tiket Terjual", "ticket_sold")
+ticket_summary_map, ticket_summary_selected = file_section("Tiket Summary", "ticket_summary")
+invoice_map, invoice_selected = file_section("Invoice", "invoice")
 
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    ticket_sold_map, ticket_sold_selected = file_section("Uploader Tiket Terjual", "ticket_sold")
-
-with col2:
-    ticket_summary_map, ticket_summary_selected = file_section("Uploader Tiket Summary", "ticket_summary")
-
-with col3:
-    invoice_map, invoice_selected = file_section("Uploader Invoice", "invoice")
-
-ticket_sold_df = render_preview("Tiket Terjual", ticket_sold_map, ticket_sold_selected)
-ticket_summary_df = render_preview("Tiket Summary", ticket_summary_map, ticket_summary_selected)
-invoice_df = render_preview("Invoice", invoice_map, invoice_selected)
-
-if not ticket_summary_df.empty and not invoice_df.empty:
-    render_validation(ticket_summary_df, invoice_df)
+ticket_sold_df = combine_selected_sheets(ticket_sold_map, ticket_sold_selected) if ticket_sold_map and ticket_sold_selected else pd.DataFrame()
+ticket_summary_df = combine_selected_sheets(ticket_summary_map, ticket_summary_selected) if ticket_summary_map and ticket_summary_selected else pd.DataFrame()
+invoice_df = combine_selected_sheets(invoice_map, invoice_selected) if invoice_map and invoice_selected else pd.DataFrame()
 
 ready = all(
     [
@@ -926,10 +845,8 @@ ready = all(
     ]
 )
 
-if not ready:
-    st.info("Lengkapi 3 uploader dan pilih minimal 1 file/sheet pada masing-masing uploader.")
-else:
-    reconciliation_df, detail_tables, warnings_list = build_reconciliation(
+if ready:
+    reconciliation_df, _warnings = build_reconciliation(
         ticket_sold_df=ticket_sold_df,
         ticket_summary_df=ticket_summary_df,
         invoice_df=invoice_df,
@@ -939,55 +856,30 @@ else:
         ntg_end_date=ntg_end_date,
     )
 
-    display_df = append_total_row(
-        reconciliation_df,
-        label_col="Pelabuhan (ASAL)",
-        numeric_columns=NUMERIC_COLUMNS,
-    )
-
-    st.subheader("Tabel Rekonsiliasi Sales Channel")
     st.dataframe(
-        format_currency_columns(display_df, NUMERIC_COLUMNS),
+        format_currency_columns(reconciliation_df, NUMERIC_COLUMNS),
         use_container_width=True,
-        height=440,
+        height=420,
     )
-
-    if warnings_list:
-        with st.expander("Catatan parser", expanded=False):
-            for warning in warnings_list:
-                st.warning(warning)
-
-    excel_bytes = to_excel_bytes(reconciliation_df, detail_tables)
-    st.download_button(
-        "Download Hasil Rekonsiliasi (Excel)",
-        data=excel_bytes,
-        file_name="rekonsiliasi_sales_channel.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+else:
+    st.dataframe(
+        format_currency_columns(
+            append_total_row(
+                pd.DataFrame(
+                    {
+                        "Pelabuhan (ASAL)": DEFAULT_PORTS,
+                        "Nominal Tiket Terjual": [0.0] * len(DEFAULT_PORTS),
+                        "Nominal Penambahan": [0.0] * len(DEFAULT_PORTS),
+                        "Nominal Pengurangan": [0.0] * len(DEFAULT_PORTS),
+                        "Nominal Naik Turun Golongan": [0.0] * len(DEFAULT_PORTS),
+                        "Nominal Pinbuk": [0.0] * len(DEFAULT_PORTS),
+                    }
+                ),
+                label_col="Pelabuhan (ASAL)",
+                numeric_columns=NUMERIC_COLUMNS,
+            ),
+            NUMERIC_COLUMNS,
+        ),
+        use_container_width=True,
+        height=420,
     )
-
-    tabs = st.tabs(
-        [
-            "Detail Tiket Terjual",
-            "Detail Penambahan",
-            "Detail Pengurangan",
-            "Detail Naik Turun Golongan",
-        ]
-    )
-    tab_keys = ["tiket_terjual", "penambahan", "pengurangan", "naik_turun_golongan"]
-
-    for tab, key in zip(tabs, tab_keys):
-        with tab:
-            detail_df = detail_tables[key]
-            if detail_df.empty:
-                st.info("Tidak ada data detail.")
-            else:
-                amount_cols = [
-                    col
-                    for col in detail_df.columns
-                    if "NOMINAL" in col.upper() or "SELISIH" in col.upper() or "TARIF" in col.upper()
-                ]
-                st.dataframe(
-                    format_currency_columns(detail_df, amount_cols),
-                    use_container_width=True,
-                    height=420,
-                )
