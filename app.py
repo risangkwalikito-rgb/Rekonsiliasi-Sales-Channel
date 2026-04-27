@@ -56,6 +56,19 @@ PORT_CANDIDATES = [
     "ORIGIN",
 ]
 
+INVOICE_NUMBER_CANDIDATES = [
+    "NO INVOICE",
+    "NOMOR INVOICE",
+    "NO. INVOICE",
+    "NO.INVOICE",
+    "INVOICE NO",
+    "INVOICE NUMBER",
+    "NO INV",
+    "NOMOR INV",
+    "NO. INV",
+    "INVOICE",
+]
+
 AMOUNT_CANDIDATES_SUMMARY = [
     "TARIF",
     "NOMINAL",
@@ -87,8 +100,8 @@ AMOUNT_CANDIDATES_TICKET = [
     "JUMLAH",
 ]
 
-DEFAULT_TIME_WINDOW_START = "00:00:00"
-DEFAULT_TIME_WINDOW_END = "07:59:59"
+WINDOW_START = "00:00:00"
+WINDOW_END = "07:59:59"
 
 
 @dataclass
@@ -99,7 +112,7 @@ class AggregateResult:
 
 
 def normalize_text(value: Any) -> str:
-    if value is None:
+    if value is None or pd.isna(value):
         return ""
     text = str(value).strip().upper()
     text = re.sub(r"\s+", " ", text)
@@ -113,22 +126,56 @@ def normalize_header(value: Any) -> str:
     return text.strip()
 
 
-def clean_money_text(text: str) -> str:
-    cleaned = str(text).strip()
-    cleaned = cleaned.replace("Rp", "").replace("rp", "")
-    cleaned = cleaned.replace(" ", "")
-    cleaned = re.sub(r"[^\d,.\-]", "", cleaned)
-    return cleaned
+def normalize_invoice_number(value: Any) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+
+    if isinstance(value, (float, np.floating)):
+        if float(value).is_integer():
+            return str(int(value))
+        return str(value).strip().upper()
+
+    text = str(value).strip().upper()
+    text = re.sub(r"\s+", "", text)
+    if text in {"", "NAN", "NONE", "-"}:
+        return None
+    if re.fullmatch(r"\d+\.0", text):
+        text = text[:-2]
+    return text
+
+
+def canonical_port(value: Any) -> str | None:
+    text = normalize_text(value)
+    if not text:
+        return None
+
+    for canonical, aliases in PORT_ALIASES.items():
+        for alias in aliases:
+            if alias in text:
+                return canonical
+    return None
+
+
+def clean_money_text(value: Any) -> str:
+    text = str(value).strip()
+    text = text.replace("Rp", "").replace("rp", "")
+    text = text.replace(" ", "")
+    text = re.sub(r"[^\d,.\-]", "", text)
+    return text
 
 
 def parse_number(value: Any) -> float | None:
-    if value is None:
+    if value is None or pd.isna(value):
         return None
-    if isinstance(value, (int, float, np.integer, np.floating)) and not pd.isna(value):
+
+    if isinstance(value, (int, float, np.integer, np.floating)):
         return float(value)
 
-    text = clean_money_text(str(value))
-    if not text or text in {"-", ".", ","}:
+    text = clean_money_text(value)
+    if text in {"", "-", ".", ","}:
         return None
 
     if "," in text and "." in text:
@@ -160,25 +207,15 @@ def parse_last_number_from_row(values: Iterable[Any]) -> float | None:
         number = parse_number(value)
         if number is not None:
             numeric_values.append(number)
+
     if numeric_values:
         return numeric_values[-1]
 
-    row_text = " ".join(str(v) for v in values if v is not None)
-    matches = re.findall(r"-?\d[\d.,]*", row_text)
+    text = " ".join(str(v) for v in values if v is not None and not pd.isna(v))
+    matches = re.findall(r"-?\d[\d.,]*", text)
     if not matches:
         return None
     return parse_number(matches[-1])
-
-
-def canonical_port(value: Any) -> str | None:
-    text = normalize_text(value)
-    if not text:
-        return None
-    for canonical, aliases in PORT_ALIASES.items():
-        for alias in aliases:
-            if alias in text:
-                return canonical
-    return None
 
 
 def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -206,6 +243,25 @@ def detect_column(columns: list[str], candidates: list[str]) -> str | None:
     return None
 
 
+def detect_invoice_number_column(columns: list[str]) -> str | None:
+    normalized_columns = [normalize_header(col) for col in columns]
+
+    for candidate in [normalize_header(c) for c in INVOICE_NUMBER_CANDIDATES]:
+        for column in normalized_columns:
+            if column == candidate:
+                return column
+
+    for column in normalized_columns:
+        if "INVOICE" in column and "DATE" not in column and "TGL" not in column:
+            return column
+
+    for column in normalized_columns:
+        if "INV" in column and "DATE" not in column and "TGL" not in column:
+            return column
+
+    return None
+
+
 def parse_datetime_series(series: pd.Series) -> pd.Series:
     parsed = pd.to_datetime(series, errors="coerce", dayfirst=True)
     if parsed.notna().sum() > 0:
@@ -215,58 +271,40 @@ def parse_datetime_series(series: pd.Series) -> pd.Series:
         "%d/%m/%Y",
         "%d-%m-%Y",
         "%Y-%m-%d",
-        "%m/%d/%Y",
-        "%d/%m/%Y %H:%M:%S",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%d-%m-%Y %H:%M:%S",
         "%Y/%m/%d",
+        "%d/%m/%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%m/%d/%Y",
+        "%m/%d/%Y %H:%M:%S",
     ]
     text_series = series.astype(str)
+
     for fmt in formats:
         parsed = pd.to_datetime(text_series, format=fmt, errors="coerce")
         if parsed.notna().sum() > 0:
             return parsed
 
-    return pd.to_datetime(series.astype(str), errors="coerce")
-
-
-def exact_date_mask(series: pd.Series, target_date: date) -> pd.Series:
-    parsed = parse_datetime_series(series)
-    if parsed.notna().sum() > 0:
-        return parsed.dt.date == target_date
-
-    text = series.astype(str).str.upper()
-    patterns = [
-        target_date.strftime("%Y-%m-%d"),
-        target_date.strftime("%Y/%m/%d"),
-        target_date.strftime("%d/%m/%Y"),
-        target_date.strftime("%d-%m-%Y"),
-        target_date.strftime("%m/%d/%Y"),
-        target_date.strftime("%d %m %Y"),
-    ]
-    mask = pd.Series(False, index=series.index)
-    for pattern in patterns:
-        mask = mask | text.str.contains(pattern, regex=False, na=False)
-    return mask
-
-
-def between_date_mask(series: pd.Series, start_date: date, end_date: date) -> pd.Series:
-    parsed = parse_datetime_series(series)
-    if parsed.notna().sum() == 0:
-        return pd.Series(True, index=series.index)
-    return (parsed.dt.date >= start_date) & (parsed.dt.date <= end_date)
+    return pd.to_datetime(text_series, errors="coerce")
 
 
 def parse_time_value(value: str) -> time:
     return datetime.strptime(value, "%H:%M:%S").time()
 
 
+def between_date_mask(series: pd.Series, start_date: date, end_date: date) -> pd.Series:
+    parsed = parse_datetime_series(series)
+    if parsed.notna().sum() == 0:
+        return pd.Series(False, index=series.index)
+    return (parsed.dt.date >= start_date) & (parsed.dt.date <= end_date)
+
+
 def exact_date_time_window_mask(
     series: pd.Series,
     target_date: date,
-    window_start: str,
-    window_end: str,
+    window_start: str = WINDOW_START,
+    window_end: str = WINDOW_END,
 ) -> pd.Series:
     parsed = parse_datetime_series(series)
     if parsed.notna().sum() == 0:
@@ -275,9 +313,11 @@ def exact_date_time_window_mask(
     start_time = parse_time_value(window_start)
     end_time = parse_time_value(window_end)
 
-    date_match = parsed.dt.date == target_date
-    time_match = (parsed.dt.time >= start_time) & (parsed.dt.time <= end_time)
-    return date_match & time_match
+    return (parsed.dt.date == target_date) & (parsed.dt.time >= start_time) & (parsed.dt.time <= end_time)
+
+
+def base_result() -> pd.Series:
+    return pd.Series(0.0, index=DEFAULT_PORTS, dtype=float)
 
 
 def read_uploaded_file(uploaded_file: Any) -> dict[str, pd.DataFrame]:
@@ -285,7 +325,7 @@ def read_uploaded_file(uploaded_file: Any) -> dict[str, pd.DataFrame]:
     content = uploaded_file.getvalue()
     buffer = io.BytesIO(content)
 
-    if file_name.endswith((".xlsx", ".xlsm", ".xls")):
+    if file_name.endswith((".xlsx", ".xls", ".xlsm")):
         raw = pd.read_excel(buffer, sheet_name=None, dtype=object)
         return {sheet_name: prepare_dataframe(df) for sheet_name, df in raw.items()}
 
@@ -297,31 +337,45 @@ def read_uploaded_file(uploaded_file: Any) -> dict[str, pd.DataFrame]:
             df = pd.read_csv(buffer, dtype=object, sep=";")
         return {"CSV": prepare_dataframe(df)}
 
-    raise ValueError("Format file belum didukung. Gunakan Excel atau CSV.")
+    raise ValueError("Format file tidak didukung. Gunakan Excel atau CSV.")
 
 
-def combine_selected_sheets(sheet_map: dict[str, pd.DataFrame], selected_sheets: list[str]) -> pd.DataFrame:
+def load_multiple_files(uploaded_files: list[Any]) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    sheet_map: dict[str, pd.DataFrame] = {}
+    errors: list[str] = []
+
+    for uploaded_file in uploaded_files:
+        try:
+            file_sheets = read_uploaded_file(uploaded_file)
+            for sheet_name, df in file_sheets.items():
+                key = f"{uploaded_file.name} :: {sheet_name}"
+                df_copy = df.copy()
+                df_copy["__FILE__"] = uploaded_file.name
+                df_copy["__SHEET__"] = sheet_name
+                sheet_map[key] = df_copy
+        except Exception as exc:
+            errors.append(f"{uploaded_file.name}: {exc}")
+
+    return sheet_map, errors
+
+
+def combine_selected_sheets(sheet_map: dict[str, pd.DataFrame], selected_keys: list[str]) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
-    for sheet_name in selected_sheets:
-        df = sheet_map[sheet_name].copy()
-        df["__SOURCE__"] = sheet_name
+
+    for key in selected_keys:
+        df = sheet_map[key].copy()
+        df["__SOURCE__"] = key
         frames.append(df)
+
     if not frames:
         return pd.DataFrame()
+
     return pd.concat(frames, ignore_index=True, sort=False)
 
 
-def base_result() -> pd.Series:
-    return pd.Series(0.0, index=DEFAULT_PORTS, dtype=float)
-
-
-def aggregate_summary_exact_datetime_window(
-    df: pd.DataFrame,
-    target_date: date,
-    window_start: str = DEFAULT_TIME_WINDOW_START,
-    window_end: str = DEFAULT_TIME_WINDOW_END,
-) -> AggregateResult:
+def aggregate_summary_window(df: pd.DataFrame, target_date: date) -> AggregateResult:
     warnings: list[str] = []
+
     if df.empty:
         return AggregateResult(base_result(), pd.DataFrame(), ["File Tiket Summary kosong."])
 
@@ -330,7 +384,7 @@ def aggregate_summary_exact_datetime_window(
     amount_col = detect_column(df.columns.tolist(), AMOUNT_CANDIDATES_SUMMARY)
 
     if date_col is None:
-        return AggregateResult(base_result(), pd.DataFrame(), ["Kolom tanggal Tiket Summary tidak ditemukan."])
+        return AggregateResult(base_result(), pd.DataFrame(), ["Kolom CETAK BOARDING PASS/Tanggal Tiket Summary tidak ditemukan."])
     if port_col is None:
         return AggregateResult(base_result(), pd.DataFrame(), ["Kolom ASAL/Pelabuhan Tiket Summary tidak ditemukan."])
     if amount_col is None:
@@ -347,8 +401,7 @@ def aggregate_summary_exact_datetime_window(
         & work["__DATETIME__"].notna()
     ].copy()
 
-    mask = exact_date_time_window_mask(work[date_col], target_date, window_start, window_end)
-    work = work[mask].copy()
+    work = work[exact_date_time_window_mask(work[date_col], target_date, WINDOW_START, WINDOW_END)].copy()
 
     grouped = work.groupby("__PORT__")["__AMOUNT__"].sum()
     result = base_result().add(grouped, fill_value=0.0)
@@ -366,126 +419,201 @@ def aggregate_summary_exact_datetime_window(
 
     if detail.empty:
         warnings.append(
-            "Tidak ada data Tiket Summary untuk "
-            f"tanggal {target_date.strftime('%Y/%m/%d')} "
-            f"jam {window_start} - {window_end}."
+            f"Tidak ada data Tiket Summary untuk tanggal {target_date.strftime('%Y/%m/%d')} "
+            f"jam {WINDOW_START} - {WINDOW_END}."
         )
 
     return AggregateResult(result, detail, warnings)
 
 
-def aggregate_summary_range(df: pd.DataFrame, start_date: date, end_date: date) -> AggregateResult:
+def aggregate_summary_by_invoice_number(
+    df: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+) -> tuple[pd.DataFrame, list[str]]:
     warnings: list[str] = []
+
     if df.empty:
-        return AggregateResult(base_result(), pd.DataFrame(), ["File Tiket Summary kosong."])
+        return pd.DataFrame(columns=["PELABUHAN", "NOMOR_INVOICE", "NOMINAL_TIKET_SUMMARY"]), ["File Tiket Summary kosong."]
 
     date_col = detect_column(df.columns.tolist(), ["CETAK BOARDING PASS"] + DATE_CANDIDATES)
     port_col = detect_column(df.columns.tolist(), PORT_CANDIDATES)
     amount_col = detect_column(df.columns.tolist(), AMOUNT_CANDIDATES_SUMMARY)
+    invoice_col = detect_invoice_number_column(df.columns.tolist())
 
     if date_col is None:
-        return AggregateResult(base_result(), pd.DataFrame(), ["Kolom tanggal Tiket Summary tidak ditemukan."])
+        return pd.DataFrame(columns=["PELABUHAN", "NOMOR_INVOICE", "NOMINAL_TIKET_SUMMARY"]), ["Kolom tanggal Tiket Summary tidak ditemukan."]
     if port_col is None:
-        return AggregateResult(base_result(), pd.DataFrame(), ["Kolom ASAL/Pelabuhan Tiket Summary tidak ditemukan."])
+        return pd.DataFrame(columns=["PELABUHAN", "NOMOR_INVOICE", "NOMINAL_TIKET_SUMMARY"]), ["Kolom ASAL/Pelabuhan Tiket Summary tidak ditemukan."]
     if amount_col is None:
-        return AggregateResult(base_result(), pd.DataFrame(), ["Kolom Tarif/Nominal Tiket Summary tidak ditemukan."])
+        return pd.DataFrame(columns=["PELABUHAN", "NOMOR_INVOICE", "NOMINAL_TIKET_SUMMARY"]), ["Kolom Tarif/Nominal Tiket Summary tidak ditemukan."]
+    if invoice_col is None:
+        return pd.DataFrame(columns=["PELABUHAN", "NOMOR_INVOICE", "NOMINAL_TIKET_SUMMARY"]), ["Kolom Nomor Invoice di Tiket Summary tidak ditemukan."]
 
     work = df.copy()
     work["__PORT__"] = work[port_col].apply(canonical_port)
     work["__AMOUNT__"] = work[amount_col].apply(parse_number)
-    work = work[work["__PORT__"].notna() & work["__AMOUNT__"].notna()].copy()
+    work["__INVOICE__"] = work[invoice_col].apply(normalize_invoice_number)
+    work["__DATETIME__"] = parse_datetime_series(work[date_col])
 
-    mask = between_date_mask(work[date_col], start_date, end_date)
-    work = work[mask].copy()
+    work = work[
+        work["__PORT__"].notna()
+        & work["__AMOUNT__"].notna()
+        & work["__INVOICE__"].notna()
+        & work["__DATETIME__"].notna()
+    ].copy()
 
-    grouped = work.groupby("__PORT__")["__AMOUNT__"].sum()
-    result = base_result().add(grouped, fill_value=0.0)
+    work = work[between_date_mask(work[date_col], start_date, end_date)].copy()
 
-    detail = work[[date_col, port_col, amount_col, "__PORT__", "__AMOUNT__", "__SOURCE__"]].rename(
-        columns={
-            date_col: "TANGGAL_SUMMARY",
-            port_col: "ASAL_SUMBER",
-            amount_col: "NOMINAL_SUMBER",
-            "__PORT__": "PELABUHAN",
-            "__AMOUNT__": "NOMINAL",
-            "__SOURCE__": "SUMBER_FILE_SHEET",
-        }
-    )
-    if detail.empty:
+    if work.empty:
         warnings.append(
-            f"Tidak ada data Tiket Summary untuk rentang {start_date.strftime('%d-%m-%Y')} s.d. {end_date.strftime('%d-%m-%Y')}."
+            f"Tidak ada data Tiket Summary per nomor invoice untuk rentang "
+            f"{start_date.strftime('%d-%m-%Y')} s.d. {end_date.strftime('%d-%m-%Y')}."
         )
+        return pd.DataFrame(columns=["PELABUHAN", "NOMOR_INVOICE", "NOMINAL_TIKET_SUMMARY"]), warnings
 
-    return AggregateResult(result, detail, warnings)
+    grouped = (
+        work.groupby(["__PORT__", "__INVOICE__"], as_index=False)["__AMOUNT__"]
+        .sum()
+        .rename(
+            columns={
+                "__PORT__": "PELABUHAN",
+                "__INVOICE__": "NOMOR_INVOICE",
+                "__AMOUNT__": "NOMINAL_TIKET_SUMMARY",
+            }
+        )
+    )
+
+    return grouped, warnings
 
 
-def aggregate_invoice_range(df: pd.DataFrame, start_date: date, end_date: date) -> AggregateResult:
+def aggregate_invoice_by_invoice_number(
+    df: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+) -> tuple[pd.DataFrame, list[str]]:
     warnings: list[str] = []
+
     if df.empty:
-        return AggregateResult(base_result(), pd.DataFrame(), ["File Invoice kosong."])
+        return pd.DataFrame(columns=["PELABUHAN", "NOMOR_INVOICE", "NOMINAL_INVOICE"]), ["File Invoice kosong."]
 
     date_col = detect_column(df.columns.tolist(), DATE_CANDIDATES)
     port_col = detect_column(df.columns.tolist(), PORT_CANDIDATES)
     amount_col = detect_column(df.columns.tolist(), AMOUNT_CANDIDATES_INVOICE)
+    invoice_col = detect_invoice_number_column(df.columns.tolist())
 
     if port_col is None:
-        return AggregateResult(base_result(), pd.DataFrame(), ["Kolom ASAL/Pelabuhan Invoice tidak ditemukan."])
+        return pd.DataFrame(columns=["PELABUHAN", "NOMOR_INVOICE", "NOMINAL_INVOICE"]), ["Kolom ASAL/Pelabuhan di Invoice tidak ditemukan."]
     if amount_col is None:
-        return AggregateResult(base_result(), pd.DataFrame(), ["Kolom Nominal/Total Invoice tidak ditemukan."])
+        return pd.DataFrame(columns=["PELABUHAN", "NOMOR_INVOICE", "NOMINAL_INVOICE"]), ["Kolom Nominal/Total di Invoice tidak ditemukan."]
+    if invoice_col is None:
+        return pd.DataFrame(columns=["PELABUHAN", "NOMOR_INVOICE", "NOMINAL_INVOICE"]), ["Kolom Nomor Invoice di file Invoice tidak ditemukan."]
 
     work = df.copy()
     work["__PORT__"] = work[port_col].apply(canonical_port)
     work["__AMOUNT__"] = work[amount_col].apply(parse_number)
-    work = work[work["__PORT__"].notna() & work["__AMOUNT__"].notna()].copy()
+    work["__INVOICE__"] = work[invoice_col].apply(normalize_invoice_number)
+
+    work = work[
+        work["__PORT__"].notna()
+        & work["__AMOUNT__"].notna()
+        & work["__INVOICE__"].notna()
+    ].copy()
 
     if date_col is not None:
-        mask = between_date_mask(work[date_col], start_date, end_date)
-        work = work[mask].copy()
+        parsed = parse_datetime_series(work[date_col])
+        work = work[parsed.notna()].copy()
+        work = work[between_date_mask(work[date_col], start_date, end_date)].copy()
     else:
-        warnings.append("Kolom tanggal Invoice tidak ditemukan. Perhitungan Invoice memakai seluruh baris yang cocok.")
+        warnings.append("Kolom tanggal di Invoice tidak ditemukan. Data Invoice dipakai seluruhnya untuk pembanding nomor invoice.")
 
-    grouped = work.groupby("__PORT__")["__AMOUNT__"].sum()
+    if work.empty:
+        warnings.append(
+            f"Tidak ada data Invoice per nomor invoice untuk rentang "
+            f"{start_date.strftime('%d-%m-%Y')} s.d. {end_date.strftime('%d-%m-%Y')}."
+        )
+        return pd.DataFrame(columns=["PELABUHAN", "NOMOR_INVOICE", "NOMINAL_INVOICE"]), warnings
+
+    grouped = (
+        work.groupby(["__PORT__", "__INVOICE__"], as_index=False)["__AMOUNT__"]
+        .sum()
+        .rename(
+            columns={
+                "__PORT__": "PELABUHAN",
+                "__INVOICE__": "NOMOR_INVOICE",
+                "__AMOUNT__": "NOMINAL_INVOICE",
+            }
+        )
+    )
+
+    return grouped, warnings
+
+
+def aggregate_naik_turun_golongan(
+    invoice_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+) -> AggregateResult:
+    invoice_grouped, invoice_warnings = aggregate_invoice_by_invoice_number(invoice_df, start_date, end_date)
+    summary_grouped, summary_warnings = aggregate_summary_by_invoice_number(summary_df, start_date, end_date)
+
+    warnings = invoice_warnings + summary_warnings
+
+    merged = pd.merge(
+        invoice_grouped,
+        summary_grouped,
+        on=["PELABUHAN", "NOMOR_INVOICE"],
+        how="outer",
+    )
+
+    if merged.empty:
+        return AggregateResult(base_result(), pd.DataFrame(), warnings or ["Tidak ada data Naik Turun Golongan yang bisa dibandingkan."])
+
+    merged["ADA_DI_INVOICE"] = merged["NOMINAL_INVOICE"].notna()
+    merged["ADA_DI_TIKET_SUMMARY"] = merged["NOMINAL_TIKET_SUMMARY"].notna()
+
+    merged["NOMINAL_INVOICE"] = merged["NOMINAL_INVOICE"].fillna(0.0)
+    merged["NOMINAL_TIKET_SUMMARY"] = merged["NOMINAL_TIKET_SUMMARY"].fillna(0.0)
+    merged["SELISIH"] = merged["NOMINAL_INVOICE"] - merged["NOMINAL_TIKET_SUMMARY"]
+
+    merged["STATUS"] = np.select(
+        [
+            merged["ADA_DI_INVOICE"] & merged["ADA_DI_TIKET_SUMMARY"],
+            merged["ADA_DI_INVOICE"] & ~merged["ADA_DI_TIKET_SUMMARY"],
+            ~merged["ADA_DI_INVOICE"] & merged["ADA_DI_TIKET_SUMMARY"],
+        ],
+        [
+            "MATCHED",
+            "HANYA_DI_INVOICE",
+            "HANYA_DI_TIKET_SUMMARY",
+        ],
+        default="UNKNOWN",
+    )
+
+    grouped = merged.groupby("PELABUHAN")["SELISIH"].sum()
     result = base_result().add(grouped, fill_value=0.0)
 
-    selected_columns = [port_col, amount_col, "__PORT__", "__AMOUNT__", "__SOURCE__"]
-    rename_map = {
-        port_col: "ASAL_SUMBER",
-        amount_col: "NOMINAL_SUMBER",
-        "__PORT__": "PELABUHAN",
-        "__AMOUNT__": "NOMINAL",
-        "__SOURCE__": "SUMBER_FILE_SHEET",
-    }
-    if date_col is not None:
-        selected_columns.insert(0, date_col)
-        rename_map[date_col] = "TANGGAL_INVOICE"
-
-    detail = work[selected_columns].rename(columns=rename_map)
-    if detail.empty:
-        warnings.append(
-            f"Tidak ada data Invoice untuk rentang {start_date.strftime('%d-%m-%Y')} s.d. {end_date.strftime('%d-%m-%Y')}."
-        )
+    detail = merged[
+        [
+            "PELABUHAN",
+            "NOMOR_INVOICE",
+            "NOMINAL_INVOICE",
+            "NOMINAL_TIKET_SUMMARY",
+            "SELISIH",
+            "STATUS",
+        ]
+    ].sort_values(["PELABUHAN", "NOMOR_INVOICE"]).reset_index(drop=True)
 
     return AggregateResult(result, detail, warnings)
 
 
-def extract_ticket_sold_totals(df: pd.DataFrame) -> AggregateResult:
+def extract_ticket_sold_structured(df: pd.DataFrame) -> AggregateResult:
     warnings: list[str] = []
+
     if df.empty:
         return AggregateResult(base_result(), pd.DataFrame(), ["File Tiket Terjual kosong."])
 
-    structured = extract_ticket_sold_structured(df)
-    if structured.series.sum() > 0:
-        return structured
-
-    fallback = extract_ticket_sold_report_style(df)
-    if fallback.series.sum() == 0:
-        warnings.extend(structured.warnings)
-        warnings.extend(fallback.warnings)
-    return AggregateResult(fallback.series, fallback.detail, warnings or fallback.warnings)
-
-
-def extract_ticket_sold_structured(df: pd.DataFrame) -> AggregateResult:
-    warnings: list[str] = []
     port_col = detect_column(df.columns.tolist(), PORT_CANDIDATES)
     amount_col = detect_column(df.columns.tolist(), AMOUNT_CANDIDATES_TICKET)
 
@@ -493,11 +621,12 @@ def extract_ticket_sold_structured(df: pd.DataFrame) -> AggregateResult:
         return AggregateResult(base_result(), pd.DataFrame(), ["Mode kolom terstruktur Tiket Terjual tidak terdeteksi."])
 
     work = df.copy()
+    work["__ROW_NO__"] = np.arange(len(work))
     work["__PORT__"] = work[port_col].apply(canonical_port)
     work["__AMOUNT__"] = work[amount_col].apply(parse_number)
     work["__ROW_TEXT__"] = work.astype(str).agg(" | ".join, axis=1).apply(normalize_text)
-    work = work[work["__PORT__"].notna() & work["__AMOUNT__"].notna()].copy()
 
+    work = work[work["__PORT__"].notna() & work["__AMOUNT__"].notna()].copy()
     if work.empty:
         return AggregateResult(base_result(), pd.DataFrame(), ["Tidak ada data Tiket Terjual yang cocok pada mode terstruktur."])
 
@@ -508,20 +637,14 @@ def extract_ticket_sold_structured(df: pd.DataFrame) -> AggregateResult:
     )
 
     if subtotal_mask.any():
-        subtotal_rows = work[subtotal_mask].copy()
-        subtotal_rows["__ORDER__"] = np.arange(len(subtotal_rows))
-        subtotal_rows = subtotal_rows.sort_values(["__PORT__", "__ORDER__"])
-        chosen = subtotal_rows.groupby("__PORT__", as_index=False).tail(1)
-
-        grouped = chosen.groupby("__PORT__")["__AMOUNT__"].sum()
-        detail_source = chosen
+        selected = work[subtotal_mask].sort_values(["__PORT__", "__ROW_NO__"]).groupby("__PORT__", as_index=False).tail(1)
     else:
-        grouped = work.groupby("__PORT__")["__AMOUNT__"].sum()
-        detail_source = work
+        selected = work.sort_values(["__PORT__", "__ROW_NO__"]).groupby("__PORT__", as_index=False).tail(1)
 
+    grouped = selected.groupby("__PORT__")["__AMOUNT__"].sum()
     result = base_result().add(grouped, fill_value=0.0)
 
-    detail = detail_source[[port_col, amount_col, "__PORT__", "__AMOUNT__", "__SOURCE__"]].rename(
+    detail = selected[[port_col, amount_col, "__PORT__", "__AMOUNT__", "__SOURCE__"]].rename(
         columns={
             port_col: "SUMBER_PORT",
             amount_col: "NOMINAL_SUMBER",
@@ -530,19 +653,25 @@ def extract_ticket_sold_structured(df: pd.DataFrame) -> AggregateResult:
             "__SOURCE__": "SUMBER_FILE_SHEET",
         }
     )
+
     return AggregateResult(result, detail, warnings)
 
 
 def extract_ticket_sold_report_style(df: pd.DataFrame) -> AggregateResult:
     warnings: list[str] = []
+
+    if df.empty:
+        return AggregateResult(base_result(), pd.DataFrame(), ["File Tiket Terjual kosong."])
+
     candidates: list[dict[str, Any]] = []
     current_port: str | None = None
 
     for idx, row in df.iterrows():
         row_values = row.tolist()
         row_text = " | ".join("" if pd.isna(v) else str(v) for v in row_values)
-        normalized_row_text = normalize_text(row_text)
-        explicit_port = canonical_port(normalized_row_text)
+        normalized_row = normalize_text(row_text)
+
+        explicit_port = canonical_port(normalized_row)
         if explicit_port:
             current_port = explicit_port
 
@@ -555,15 +684,13 @@ def extract_ticket_sold_report_style(df: pd.DataFrame) -> AggregateResult:
             continue
 
         priority = 0
-        if "SUB TOTAL" in normalized_row_text or "SUBTOTAL" in normalized_row_text:
+        if "SUB TOTAL" in normalized_row or "SUBTOTAL" in normalized_row:
             priority = 3
-        elif "TOTAL JUMLAH" in normalized_row_text:
+        elif "TOTAL JUMLAH" in normalized_row:
             priority = 2
         elif explicit_port is not None:
             priority = 1
 
-        if "GRAND TOTAL" in normalized_row_text and explicit_port is None and priority == 0:
-            continue
         if priority == 0:
             continue
 
@@ -573,7 +700,7 @@ def extract_ticket_sold_report_style(df: pd.DataFrame) -> AggregateResult:
                 "PELABUHAN": target_port,
                 "NOMINAL": float(amount),
                 "PRIORITY": priority,
-                "ROW_TEXT": row_text,
+                "BARIS_SUMBER": row_text,
                 "SUMBER_FILE_SHEET": row.get("__SOURCE__", ""),
             }
         )
@@ -584,81 +711,61 @@ def extract_ticket_sold_report_style(df: pd.DataFrame) -> AggregateResult:
     candidate_df = pd.DataFrame(candidates)
     candidate_df = candidate_df.sort_values(["PELABUHAN", "PRIORITY", "ROW_INDEX"], ascending=[True, False, False])
 
-    chosen_rows: list[pd.Series] = []
+    selected_rows: list[pd.Series] = []
     for port in DEFAULT_PORTS:
         subset = candidate_df[candidate_df["PELABUHAN"] == port]
-        if subset.empty:
-            continue
-        chosen_rows.append(subset.iloc[0])
+        if not subset.empty:
+            selected_rows.append(subset.iloc[0])
 
-    if not chosen_rows:
-        return AggregateResult(base_result(), pd.DataFrame(), ["Tidak ada subtotal/total Tiket Terjual yang cocok per pelabuhan."])
+    if not selected_rows:
+        return AggregateResult(base_result(), pd.DataFrame(), ["Tidak ada total Tiket Terjual yang cocok per pelabuhan."])
 
-    chosen_df = pd.DataFrame(chosen_rows)
-    grouped = chosen_df.groupby("PELABUHAN")["NOMINAL"].sum()
+    selected = pd.DataFrame(selected_rows)
+    grouped = selected.groupby("PELABUHAN")["NOMINAL"].sum()
     result = base_result().add(grouped, fill_value=0.0)
 
-    detail = chosen_df[["PELABUHAN", "NOMINAL", "PRIORITY", "ROW_INDEX", "ROW_TEXT", "SUMBER_FILE_SHEET"]].rename(
-        columns={"ROW_TEXT": "BARIS_SUMBER"}
-    )
-    return AggregateResult(result, detail, warnings)
+    return AggregateResult(result, selected.reset_index(drop=True), warnings)
 
 
-def format_currency_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    formatted = df.copy()
-    for column in columns:
-        if column in formatted.columns:
-            formatted[column] = formatted[column].apply(
-                lambda x: f"{x:,.0f}".replace(",", ".") if pd.notna(x) else ""
-            )
-    return formatted
+def extract_ticket_sold_totals(df: pd.DataFrame) -> AggregateResult:
+    structured = extract_ticket_sold_structured(df)
+    if structured.series.sum() != 0:
+        return structured
+
+    fallback = extract_ticket_sold_report_style(df)
+    if fallback.series.sum() != 0:
+        return fallback
+
+    warnings = structured.warnings + fallback.warnings
+    return AggregateResult(base_result(), pd.DataFrame(), warnings)
 
 
 def build_reconciliation(
     ticket_sold_df: pd.DataFrame,
     ticket_summary_df: pd.DataFrame,
     invoice_df: pd.DataFrame,
-    summary_start_date: date,
-    summary_end_date: date,
+    addition_date: date,
+    deduction_date: date,
     ntg_start_date: date,
     ntg_end_date: date,
-    addition_window_start: str,
-    addition_window_end: str,
-    deduction_window_start: str,
-    deduction_window_end: str,
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], list[str]]:
     warnings: list[str] = []
 
     ticket_sold = extract_ticket_sold_totals(ticket_sold_df)
-    addition = aggregate_summary_exact_datetime_window(
-        ticket_summary_df,
-        summary_start_date,
-        addition_window_start,
-        addition_window_end,
-    )
-    deduction = aggregate_summary_exact_datetime_window(
-        ticket_summary_df,
-        summary_end_date,
-        deduction_window_start,
-        deduction_window_end,
-    )
-    summary_range = aggregate_summary_range(ticket_summary_df, ntg_start_date, ntg_end_date)
-    invoice_range = aggregate_invoice_range(invoice_df, ntg_start_date, ntg_end_date)
+    addition = aggregate_summary_window(ticket_summary_df, addition_date)
+    deduction = aggregate_summary_window(ticket_summary_df, deduction_date)
+    naik_turun = aggregate_naik_turun_golongan(invoice_df, ticket_summary_df, ntg_start_date, ntg_end_date)
 
     warnings.extend(ticket_sold.warnings)
     warnings.extend(addition.warnings)
     warnings.extend(deduction.warnings)
-    warnings.extend(summary_range.warnings)
-    warnings.extend(invoice_range.warnings)
+    warnings.extend(naik_turun.warnings)
 
     result = pd.DataFrame({"Pelabuhan (ASAL)": DEFAULT_PORTS})
     result["Nominal Tiket Terjual"] = result["Pelabuhan (ASAL)"].map(ticket_sold.series).fillna(0.0)
     result["Nominal Penambahan"] = result["Pelabuhan (ASAL)"].map(addition.series).fillna(0.0)
     result["Nominal Pengurangan"] = result["Pelabuhan (ASAL)"].map(deduction.series).fillna(0.0)
-    result["Nominal Naik Turun Golongan"] = (
-        result["Pelabuhan (ASAL)"].map(invoice_range.series).fillna(0.0)
-        - result["Pelabuhan (ASAL)"].map(summary_range.series).fillna(0.0)
-    )
+    result["Nominal Naik Turun Golongan"] = result["Pelabuhan (ASAL)"].map(naik_turun.series).fillna(0.0)
     result["Nominal Pinbuk"] = (
         result["Nominal Tiket Terjual"]
         + result["Nominal Penambahan"]
@@ -666,52 +773,41 @@ def build_reconciliation(
         + result["Nominal Naik Turun Golongan"]
     )
 
-    detail_tables = {
+    details = {
         "tiket_terjual": ticket_sold.detail,
         "penambahan": addition.detail,
         "pengurangan": deduction.detail,
-        "summary_range": summary_range.detail,
-        "invoice_range": invoice_range.detail,
+        "naik_turun_golongan": naik_turun.detail,
     }
-    return result, detail_tables, warnings
+
+    unique_warnings = list(dict.fromkeys(warnings))
+    return result, details, unique_warnings
+
+
+def format_currency_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    result = df.copy()
+    for col in columns:
+        if col in result.columns:
+            result[col] = result[col].apply(lambda x: f"{x:,.0f}".replace(",", ".") if pd.notna(x) else "")
+    return result
 
 
 def to_excel_bytes(reconciliation_df: pd.DataFrame, detail_tables: dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         reconciliation_df.to_excel(writer, index=False, sheet_name="Rekonsiliasi")
-        for sheet_name, detail_df in detail_tables.items():
-            safe_sheet_name = sheet_name[:31]
-            detail_df.to_excel(writer, index=False, sheet_name=safe_sheet_name)
+        for name, detail_df in detail_tables.items():
+            detail_df.to_excel(writer, index=False, sheet_name=name[:31])
     output.seek(0)
     return output.getvalue()
-
-
-def load_multiple_files(uploaded_files: list[Any]) -> tuple[dict[str, pd.DataFrame], list[str]]:
-    combined_sheet_map: dict[str, pd.DataFrame] = {}
-    errors: list[str] = []
-
-    for uploaded_file in uploaded_files:
-        try:
-            file_sheet_map = read_uploaded_file(uploaded_file)
-            for sheet_name, df in file_sheet_map.items():
-                combined_key = f"{uploaded_file.name} :: {sheet_name}"
-                df_copy = df.copy()
-                df_copy["__FILE__"] = uploaded_file.name
-                df_copy["__SHEET__"] = sheet_name
-                combined_sheet_map[combined_key] = df_copy
-        except Exception as exc:
-            errors.append(f"{uploaded_file.name}: {exc}")
-
-    return combined_sheet_map, errors
 
 
 def file_section(label: str, key_prefix: str) -> tuple[dict[str, pd.DataFrame] | None, list[str]]:
     uploaded_files = st.file_uploader(
         label,
         type=["xlsx", "xls", "xlsm", "csv"],
-        key=f"{key_prefix}_uploader",
         accept_multiple_files=True,
+        key=f"{key_prefix}_uploader",
     )
 
     if not uploaded_files:
@@ -719,119 +815,84 @@ def file_section(label: str, key_prefix: str) -> tuple[dict[str, pd.DataFrame] |
 
     sheet_map, errors = load_multiple_files(uploaded_files)
     for error in errors:
-        st.error(f"Gagal membaca file {label}: {error}")
+        st.error(f"Gagal membaca {label}: {error}")
 
     if not sheet_map:
         return None, []
 
-    sheet_names = list(sheet_map.keys())
+    options = list(sheet_map.keys())
     selected = st.multiselect(
         f"Pilih file/sheet untuk {label}",
-        options=sheet_names,
-        default=sheet_names,
-        key=f"{key_prefix}_sheets",
+        options=options,
+        default=options,
+        key=f"{key_prefix}_selected",
     )
     return sheet_map, selected
 
 
-def render_preview(name: str, sheet_map: dict[str, pd.DataFrame] | None, selected_sheets: list[str]) -> pd.DataFrame:
-    if not sheet_map or not selected_sheets:
+def render_preview(name: str, sheet_map: dict[str, pd.DataFrame] | None, selected: list[str]) -> pd.DataFrame:
+    if not sheet_map or not selected:
         return pd.DataFrame()
 
-    combined = combine_selected_sheets(sheet_map, selected_sheets)
+    combined = combine_selected_sheets(sheet_map, selected)
     file_count = combined["__FILE__"].nunique() if "__FILE__" in combined.columns else 0
 
     with st.expander(f"Preview {name}", expanded=False):
         st.caption(
-            f"{file_count} file | {len(selected_sheets)} file/sheet dipilih | "
+            f"{file_count} file | {len(selected)} file/sheet dipilih | "
             f"{combined.shape[0]} baris | {combined.shape[1]} kolom"
         )
         st.dataframe(combined.head(30), use_container_width=True, height=280)
-        st.write("Kolom terdeteksi:", list(combined.columns))
+
     return combined
 
 
 st.set_page_config(page_title="Rekonsiliasi Sales Channel", layout="wide")
 st.title("Rekonsiliasi Sales Channel")
 st.caption(
-    "Setiap uploader bisa upload banyak file Excel/CSV. "
-    "Nominal Penambahan dan Pengurangan difilter dari CETAK BOARDING PASS sesuai tanggal parameter "
-    "dan window jam yang dipilih."
+    "Multiple upload aktif. "
+    "Penambahan/Pengurangan memakai CETAK BOARDING PASS pada jam 00:00:00 - 07:59:59. "
+    "Naik Turun Golongan = selisih nominal per nomor invoice antara Invoice dan Tiket Summary, lalu dijumlah per pelabuhan."
 )
 
 with st.sidebar:
     st.subheader("Parameter")
 
-    summary_start_date = st.date_input(
-        "Tanggal Penambahan",
-        value=date.today(),
-        key="summary_start_date",
-    )
-    addition_window = st.text_input(
-        "Jam Penambahan (format: HH:MM:SS - HH:MM:SS)",
-        value=f"{DEFAULT_TIME_WINDOW_START} - {DEFAULT_TIME_WINDOW_END}",
-        key="addition_window",
-    )
-
-    summary_end_date = st.date_input(
-        "Tanggal Pengurangan",
-        value=date.today(),
-        key="summary_end_date",
-    )
-    deduction_window = st.text_input(
-        "Jam Pengurangan (format: HH:MM:SS - HH:MM:SS)",
-        value=f"{DEFAULT_TIME_WINDOW_START} - {DEFAULT_TIME_WINDOW_END}",
-        key="deduction_window",
-    )
-
+    addition_date = st.date_input("Tanggal Penambahan", value=date.today(), key="addition_date")
+    deduction_date = st.date_input("Tanggal Pengurangan", value=date.today(), key="deduction_date")
     ntg_start_date = st.date_input("Tanggal Naik Turun Golongan - Mulai", value=date.today(), key="ntg_start_date")
     ntg_end_date = st.date_input("Tanggal Naik Turun Golongan - Selesai", value=date.today(), key="ntg_end_date")
 
     st.markdown("---")
+    st.write("Window Penambahan/Pengurangan:")
+    st.write(f"{WINDOW_START} - {WINDOW_END}")
+    st.markdown("---")
     st.write("Pelabuhan default:")
     st.write(", ".join(DEFAULT_PORTS))
 
-def split_window_input(value: str, default_start: str, default_end: str) -> tuple[str, str]:
-    try:
-        start_value, end_value = [part.strip() for part in value.split("-", 1)]
-        parse_time_value(start_value)
-        parse_time_value(end_value)
-        return start_value, end_value
-    except Exception:
-        return default_start, default_end
-
-
-addition_window_start, addition_window_end = split_window_input(
-    addition_window,
-    DEFAULT_TIME_WINDOW_START,
-    DEFAULT_TIME_WINDOW_END,
-)
-deduction_window_start, deduction_window_end = split_window_input(
-    deduction_window,
-    DEFAULT_TIME_WINDOW_START,
-    DEFAULT_TIME_WINDOW_END,
-)
-
 col1, col2, col3 = st.columns(3)
-with col1:
-    ticket_sold_map, ticket_sold_sheets = file_section("Uploader Tiket Terjual", "ticket_sold")
-with col2:
-    ticket_summary_map, ticket_summary_sheets = file_section("Uploader Tiket Summary", "ticket_summary")
-with col3:
-    invoice_map, invoice_sheets = file_section("Uploader Invoice", "invoice")
 
-ticket_sold_df = render_preview("Tiket Terjual", ticket_sold_map, ticket_sold_sheets)
-ticket_summary_df = render_preview("Tiket Summary", ticket_summary_map, ticket_summary_sheets)
-invoice_df = render_preview("Invoice", invoice_map, invoice_sheets)
+with col1:
+    ticket_sold_map, ticket_sold_selected = file_section("Uploader Tiket Terjual", "ticket_sold")
+
+with col2:
+    ticket_summary_map, ticket_summary_selected = file_section("Uploader Tiket Summary", "ticket_summary")
+
+with col3:
+    invoice_map, invoice_selected = file_section("Uploader Invoice", "invoice")
+
+ticket_sold_df = render_preview("Tiket Terjual", ticket_sold_map, ticket_sold_selected)
+ticket_summary_df = render_preview("Tiket Summary", ticket_summary_map, ticket_summary_selected)
+invoice_df = render_preview("Invoice", invoice_map, invoice_selected)
 
 ready = all(
     [
         ticket_sold_map is not None,
         ticket_summary_map is not None,
         invoice_map is not None,
-        len(ticket_sold_sheets) > 0,
-        len(ticket_summary_sheets) > 0,
-        len(invoice_sheets) > 0,
+        len(ticket_sold_selected) > 0,
+        len(ticket_summary_selected) > 0,
+        len(invoice_selected) > 0,
     ]
 )
 
@@ -842,14 +903,10 @@ else:
         ticket_sold_df=ticket_sold_df,
         ticket_summary_df=ticket_summary_df,
         invoice_df=invoice_df,
-        summary_start_date=summary_start_date,
-        summary_end_date=summary_end_date,
+        addition_date=addition_date,
+        deduction_date=deduction_date,
         ntg_start_date=ntg_start_date,
         ntg_end_date=ntg_end_date,
-        addition_window_start=addition_window_start,
-        addition_window_end=addition_window_end,
-        deduction_window_start=deduction_window_start,
-        deduction_window_end=deduction_window_end,
     )
 
     numeric_columns = [
@@ -861,26 +918,30 @@ else:
     ]
 
     st.subheader("Tabel Rekonsiliasi Sales Channel")
-    st.caption(
-        f"Penambahan: {summary_start_date.strftime('%Y/%m/%d')} {addition_window_start} - {addition_window_end} | "
-        f"Pengurangan: {summary_end_date.strftime('%Y/%m/%d')} {deduction_window_start} - {deduction_window_end}"
+    st.dataframe(
+        format_currency_columns(reconciliation_df, numeric_columns),
+        use_container_width=True,
+        height=360,
     )
-    st.dataframe(format_currency_columns(reconciliation_df, numeric_columns), use_container_width=True, height=360)
 
     total_row = reconciliation_df[numeric_columns].sum().to_frame().T
     total_row.insert(0, "Pelabuhan (ASAL)", "TOTAL")
+
     st.subheader("Grand Total")
-    st.dataframe(format_currency_columns(total_row, numeric_columns), use_container_width=True, hide_index=True)
+    st.dataframe(
+        format_currency_columns(total_row, numeric_columns),
+        use_container_width=True,
+        hide_index=True,
+    )
 
     if warnings_list:
-        unique_warnings = list(dict.fromkeys(warnings_list))
         with st.expander("Catatan parser", expanded=False):
-            for warning in unique_warnings:
+            for warning in warnings_list:
                 st.warning(warning)
 
     excel_bytes = to_excel_bytes(reconciliation_df, detail_tables)
     st.download_button(
-        label="Download Hasil Rekonsiliasi (Excel)",
+        "Download Hasil Rekonsiliasi (Excel)",
         data=excel_bytes,
         file_name="rekonsiliasi_sales_channel.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -891,11 +952,10 @@ else:
             "Detail Tiket Terjual",
             "Detail Penambahan",
             "Detail Pengurangan",
-            "Detail Summary Range",
-            "Detail Invoice Range",
+            "Detail Naik Turun Golongan",
         ]
     )
-    tab_keys = ["tiket_terjual", "penambahan", "pengurangan", "summary_range", "invoice_range"]
+    tab_keys = ["tiket_terjual", "penambahan", "pengurangan", "naik_turun_golongan"]
 
     for tab, key in zip(tabs, tab_keys):
         with tab:
@@ -903,6 +963,12 @@ else:
             if detail_df.empty:
                 st.info("Tidak ada data detail.")
             else:
-                display_df = detail_df.copy()
-                amount_like_columns = [col for col in display_df.columns if "NOMINAL" in col.upper()]
-                st.dataframe(format_currency_columns(display_df, amount_like_columns), use_container_width=True, height=420)
+                amount_like_columns = [
+                    col for col in detail_df.columns
+                    if "NOMINAL" in col.upper() or "SELISIH" in col.upper()
+                ]
+                st.dataframe(
+                    format_currency_columns(detail_df, amount_like_columns),
+                    use_container_width=True,
+                    height=420,
+                )
